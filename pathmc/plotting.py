@@ -30,7 +30,7 @@ display it. Supported 1-D draw types:
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import arviz as az
 import numpy as np
@@ -64,6 +64,64 @@ def _as_1d(draws: np.ndarray) -> np.ndarray:
 def _integer_valued(draws: np.ndarray) -> bool:
     """True when every draw is an integer (Bernoulli, Poisson, and kin)."""
     return bool(np.all(draws == np.round(draws)))
+
+
+_DENSITY_KIND = "_pathmc_density_kind"
+
+
+def _density_kind(draws: np.ndarray) -> str:
+    """Return the scale a 1-D sample will be drawn on."""
+    if np.ptp(draws) == 0 or _integer_valued(draws):
+        return "probability"
+    return "density"
+
+
+def _reject_mixed_scale(ax: matplotlib.axes.Axes, kind: str) -> None:
+    """Refuse a density curve and a probability series on one axes.
+
+    A point mass pins the y limit near 1, and a later KDE can peak far above
+    that. Relabeling the axes would then describe one of the series wrongly.
+    """
+    existing = getattr(ax, _DENSITY_KIND, None)
+    if existing is None or existing == kind:
+        return
+    raise ValueError(
+        "Cannot overlay a density curve with a point mass or probability bars "
+        "on the same axes: they do not share a scale, and the point-mass "
+        "limits would clip the density. Plot them on separate axes."
+    )
+
+
+def _label_scan_axes(
+    da: xr.DataArray,
+    *,
+    n_times: int,
+    n_units: int,
+    time_values: Sequence[Any],
+    unit_labels: Sequence[Any],
+) -> xr.DataArray:
+    """Rename anonymous trailing ``(n_times, n_units)`` axes to time and unit.
+
+    Scan-compiled panel RVs are stored as ``{name}_dim_0`` / ``{name}_dim_1``.
+    ``latent_trajectory`` already treats those trailing axes as time and unit;
+    plot_dist must do the same or ``aggregate='time_mean'`` denies a time axis
+    that is present. Named coordinates such as ``y_predictors`` are left alone.
+    """
+    extra = [dim for dim in da.dims if dim not in ("chain", "draw", "time", "unit")]
+    if (
+        len(extra) < 2
+        or "time" in da.dims
+        or "unit" in da.dims
+        or int(da.sizes[extra[-2]]) != int(n_times)
+        or int(da.sizes[extra[-1]]) != int(n_units)
+        or "_dim_" not in extra[-2]
+        or "_dim_" not in extra[-1]
+    ):
+        return da
+    return da.rename({extra[-2]: "time", extra[-1]: "unit"}).assign_coords(
+        time=list(time_values),
+        unit=list(unit_labels),
+    )
 
 
 def _legend(ax: matplotlib.axes.Axes) -> None:
@@ -211,24 +269,34 @@ def plot_density(
 
     values = _as_1d(draws)
     if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 4))
+        fig, target = plt.subplots(figsize=(8, 4))
+        created = True
     else:
-        fig = cast("matplotlib.figure.Figure", ax.get_figure())
-        if fig is None:
+        target = ax
+        figure = target.get_figure()
+        if figure is None or target not in figure.axes:
             raise ValueError(
                 "ax is not attached to a figure. Pass an axes from "
                 "plt.subplots(), or omit ax to create a new figure."
             )
+        fig = figure
+        created = False
 
-    if np.ptp(values) == 0:
-        _plot_point_mass(ax, values, label=label, color=color)
-    elif _integer_valued(values):
-        _plot_discrete(ax, values, label=label, color=color)
+    kind = _density_kind(values)
+    _reject_mixed_scale(target, kind)
+    setattr(target, _DENSITY_KIND, kind)
+    if kind == "probability" and np.ptp(values) == 0:
+        _plot_point_mass(target, values, label=label, color=color)
+    elif kind == "probability":
+        _plot_discrete(target, values, label=label, color=color)
     else:
-        _plot_kde(ax, values, label=label, color=color)
+        _plot_kde(target, values, label=label, color=color)
     if ref is not None:
-        ax.axvline(ref, color=color, linestyle="--", linewidth=1.5)
-    fig.tight_layout()
+        target.axvline(ref, color=color, linestyle="--", linewidth=1.5)
+    # A caller-supplied axes may sit beside other panels. tight_layout would
+    # move those siblings.
+    if created:
+        fig.tight_layout()
     return fig
 
 
@@ -327,7 +395,14 @@ def _select_draws(
             "in time."
         )
     if aggregate == "time_mean":
-        selected = selected.mean(dim="time")
+        values = np.asarray(selected.values)
+        if values.size == 0 or not np.isfinite(values).all():
+            raise ValueError(
+                f"'{name}' contains non-finite values, so aggregate='time_mean' "
+                "would skip missing times and still be labeled a time mean. "
+                "Drop or impute those draws before plotting."
+            )
+        selected = selected.mean(dim="time", skipna=False)
         label = f"{label} (time mean)"
     elif "time" in selected.dims:
         selected = selected.squeeze("time", drop=True)

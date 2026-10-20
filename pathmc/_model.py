@@ -88,7 +88,12 @@ from pathmc.panel import (
     observed_means_by_time,
 )
 from pathmc.parse import Spec, parse_spec
-from pathmc.plotting import _reject_unused_coords, _select_draws, plot_density
+from pathmc.plotting import (
+    _label_scan_axes,
+    _reject_unused_coords,
+    _select_draws,
+    plot_density,
+)
 from pathmc.refute import PlaceboRefutationResult, refute_placebo as _refute_placebo
 from pathmc.sensitivity import SensitivityResult, compute_sensitivity
 from pathmc.scaling import (
@@ -888,6 +893,10 @@ class PathModel:
             Explicit collapse when a selected variable has more than one
             ``time`` or ``unit`` value. Omitted by default: those dimensions
             are not silently averaged or pooled. The legend names the collapse.
+            On a scan panel model, anonymous trailing ``(n_times, n_units)``
+            axes are labeled ``time`` and ``unit`` before this check, matching
+            ``latent_trajectory``. A density curve cannot share an axes with a
+            point mass or probability bars.
         ref : float | list[float] | None
             Reference value(s) marked with a dashed vertical line. A scalar marks
             every series at the same value; a list aligns positionally with *var*.
@@ -953,6 +962,17 @@ class PathModel:
             refs = [float(r) for r in ref]
 
         draws_by_name: list[tuple[str, np.ndarray]] = []
+        scan_info = (
+            getattr(self._gen_model, "_pathmc_panel_scan", None)
+            if self._gen_model is not None
+            else None
+        )
+        panel_time = (
+            list(scan_info.time_values) or list(range(scan_info.n_times))
+            if scan_info is not None
+            else None
+        )
+        panel_units = list(scan_info.unit_labels) if scan_info is not None else None
         applied: set[str] = set()
         for name in var:
             if name in named_draws:
@@ -964,8 +984,17 @@ class PathModel:
                     f"{sorted(named_draws)}; posterior variables: "
                     f"{sorted(str(v) for v in posterior_ds.data_vars)}"
                 )
+            array = posterior_ds[name]
+            if scan_info is not None:
+                array = _label_scan_axes(
+                    array,
+                    n_times=scan_info.n_times,
+                    n_units=scan_info.n_units,
+                    time_values=panel_time or [],
+                    unit_labels=panel_units or [],
+                )
             draws, label, matched = _select_draws(
-                posterior_ds[name],
+                array,
                 name=name,
                 coords=coords,
                 aggregate=aggregate,
@@ -988,16 +1017,22 @@ class PathModel:
             colors = list(color)
 
         if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 4))
+            fig, target = plt.subplots(figsize=(8, 4))
+            created = True
         else:
-            fig = ax.get_figure()
-            if fig is None:
+            target = ax
+            figure = target.get_figure()
+            if figure is None or target not in figure.axes:
                 raise ValueError(
                     "ax is not attached to a figure. Pass an axes from "
                     "plt.subplots(), or omit ax to create a new figure."
                 )
+            fig = figure
+            created = False
         for i, (label, draws) in enumerate(draws_by_name):
-            plot_density(draws, label=label, ref=refs[i], color=colors[i], ax=ax)
+            plot_density(draws, label=label, ref=refs[i], color=colors[i], ax=target)
+        if created:
+            fig.tight_layout()
         return fig
 
     def standardized(self) -> pd.DataFrame:

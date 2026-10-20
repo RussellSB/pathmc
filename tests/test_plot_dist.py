@@ -458,3 +458,111 @@ class TestCoordinateSelection:
 
         fig = EffectResult("a", np.random.default_rng(3).normal(size=50)).plot_dist()
         assert isinstance(fig, matplotlib.figure.Figure)
+
+
+class TestCriticRegressions:
+    def test_mixed_density_and_point_mass_raises(self):
+        import matplotlib.pyplot as plt
+
+        _, ax = plt.subplots()
+        plot_density(np.linspace(0.0, 1.0, 30), ax=ax)
+        with pytest.raises(ValueError, match="do not share a scale"):
+            plot_density(np.ones(20), ax=ax)
+
+    def test_point_mass_then_density_raises(self):
+        import matplotlib.pyplot as plt
+
+        _, ax = plt.subplots()
+        plot_density(np.ones(20), ax=ax)
+        with pytest.raises(ValueError, match="do not share a scale"):
+            plot_density(np.linspace(0.0, 1.0, 30), ax=ax)
+
+    def test_pathmodel_refuses_mixed_overlay(self):
+        model = _coord_model()
+        model._idata.posterior["sigma_M"] = xr.DataArray(
+            np.ones((1, 8)),
+            dims=("chain", "draw"),
+        )
+        with pytest.raises(ValueError, match="do not share a scale"):
+            model.plot_dist(["beta_M", "sigma_M"])
+
+    def test_time_mean_rejects_nonfinite(self):
+        values = np.zeros((2, 1, 40))
+        values[0] = -10.0
+        values[1] = np.nan
+        result = DoResult(
+            ds=xr.Dataset(
+                {"Y": (("time", "chain", "draw"), values)},
+                coords={"time": [-10.0, 10.0]},
+            )
+        )
+        with pytest.raises(ValueError, match="non-finite"):
+            result.plot_dist(aggregate="time_mean")
+
+    def test_supplied_ax_does_not_move_sibling(self):
+        import matplotlib.pyplot as plt
+
+        _, axes = plt.subplots(1, 2)
+        before = axes[1].get_position().bounds
+        plot_density(np.linspace(0.0, 1.0, 40), ax=axes[0])
+        assert axes[1].get_position().bounds == pytest.approx(before)
+
+    def test_detached_axes_raises(self):
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots()
+        fig.delaxes(ax)
+        with pytest.raises(ValueError, match="not attached"):
+            plot_density(np.linspace(0.0, 1.0, 20), ax=ax)
+
+    def test_scan_panel_raw_posterior_uses_time_policy(self):
+        import arviz as az
+        import pandas as pd
+
+        import pathmc
+
+        frame = pd.DataFrame([
+            {"unit": unit, "time": time, "x": 0.1 * time, "y": 0.2 * time}
+            for unit in ("A", "B")
+            for time in range(3)
+        ])
+        model = pathmc.model(
+            "y ~ a*lag(y) + b*x",
+            data=frame,
+            panel={"unit": "unit", "time": "time"},
+        )
+        mu = np.zeros((1, 40, 3, 2))
+        mu[:, :, 0, :] = -10.0
+        mu[:, :, 2, :] = 10.0
+        model._idata = az.from_dict(
+            {
+                "posterior": {
+                    "mu_y": mu,
+                    "beta_y": np.zeros((1, 40, 3)),
+                    "sigma_y": np.ones((1, 40)),
+                }
+            },
+            coords={"y_predictors": ["Intercept", "lag(y)", "x"]},
+            dims={
+                "mu_y": ["mu_y_dim_0", "mu_y_dim_1"],
+                "beta_y": ["y_predictors"],
+            },
+        )
+        with pytest.raises(ValueError, match="time points") as exc:
+            model.plot_dist("mu_y")
+        assert "more than one time point" not in str(exc.value)
+        with pytest.raises(ValueError, match="units"):
+            model.plot_dist("mu_y", aggregate="time_mean")
+        fig = model.plot_dist(
+            "mu_y",
+            aggregate="time_mean",
+            coords={"unit": "A"},
+        )
+        legend = _legend_text(fig)
+        assert "time mean" in legend
+        assert "unit=A" in legend
+        x = np.asarray(fig.axes[0].lines[0].get_xdata(), dtype=float)
+        y = np.asarray(fig.axes[0].lines[0].get_ydata(), dtype=float)
+        assert abs(float(x[int(np.argmax(y))])) < 2
+        with pytest.raises(ValueError, match="y_predictors"):
+            model.plot_dist("beta_y")
