@@ -30,7 +30,7 @@ display it. Supported 1-D draw types:
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import arviz as az
 import numpy as np
@@ -82,6 +82,10 @@ def _reject_mixed_scale(ax: matplotlib.axes.Axes, kind: str) -> None:
     A point mass pins the y limit near 1, and a later KDE can peak far above
     that. Relabeling the axes would then describe one of the series wrongly.
     """
+    if not ax.has_data():
+        if hasattr(ax, _DENSITY_KIND):
+            delattr(ax, _DENSITY_KIND)
+        return
     existing = getattr(ax, _DENSITY_KIND, None)
     if existing is None or existing == kind:
         return
@@ -114,8 +118,8 @@ def _label_scan_axes(
         or "unit" in da.dims
         or int(da.sizes[extra[-2]]) != int(n_times)
         or int(da.sizes[extra[-1]]) != int(n_units)
-        or "_dim_" not in extra[-2]
-        or "_dim_" not in extra[-1]
+        or "_dim_" not in str(extra[-2])
+        or "_dim_" not in str(extra[-1])
     ):
         return da
     return da.rename({extra[-2]: "time", extra[-1]: "unit"}).assign_coords(
@@ -128,6 +132,60 @@ def _legend(ax: matplotlib.axes.Axes) -> None:
     handles, labels = ax.get_legend_handles_labels()
     if labels:
         ax.legend(loc="best")
+
+
+def _coord_value(value: Any) -> Any:
+    """Return a Python scalar so the error repr keeps ints unquoted."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _sync_probability_ticks(ax: matplotlib.axes.Axes) -> None:
+    """Keep bar centers and point-mass locations on the x ticks."""
+    xs: list[float] = []
+    for line in ax.lines:
+        if line.get_marker() == "o" and line.get_linestyle() in ("None", "none"):
+            xs.extend(float(x) for x in np.asarray(line.get_xdata(), dtype=float))
+    for container in ax.containers:
+        for patch in container:
+            xs.append(float(patch.get_x() + patch.get_width() / 2))
+    if not xs or len(xs) > 20:
+        return
+    ordered = sorted(xs)
+    unique = [ordered[0]]
+    for x in ordered[1:]:
+        if abs(x - unique[-1]) > 1e-8:
+            unique.append(x)
+    ax.set_xticks(unique)
+
+
+def _place_point_mass_label(
+    ax: matplotlib.axes.Axes,
+    value: float,
+    text: str,
+    *,
+    color: str,
+) -> None:
+    """Put the point-mass annotation inside the axes, not in the margin."""
+    ax.relim()
+    ax.autoscale_view()
+    left, right = ax.get_xlim()
+    if value >= (left + right) / 2:
+        offset, ha = (-6, "right")
+    else:
+        offset, ha = (6, "left")
+    ax.annotate(
+        text,
+        xy=(value, 1.0),
+        xytext=(offset, -14),
+        textcoords="offset points",
+        ha=ha,
+        va="top",
+        color=color,
+        fontsize=9,
+        clip_on=True,
+    )
 
 
 def _plot_point_mass(
@@ -153,19 +211,16 @@ def _plot_point_mass(
         linestyle="None",
         label="_nolegend_",
     )
-    ax.annotate(
+    _place_point_mass_label(
+        ax,
+        value,
         f"point mass at {value:g} (n={draws.size})",
-        xy=(value, 1.0),
-        xytext=(6, -14),
-        textcoords="offset points",
-        ha="left",
-        va="top",
         color=color,
-        fontsize=9,
     )
     if fresh:
         ax.set_ylim(0, 1.15)
     ax.set_ylabel("Probability")
+    _sync_probability_ticks(ax)
     _legend(ax)
 
 
@@ -193,8 +248,7 @@ def _plot_discrete(
         alpha=0.6,
         label=label if label is not None else "_nolegend_",
     )
-    if values.size <= 20:
-        ax.set_xticks(values)
+    _sync_probability_ticks(ax)
     ax.set_ylabel("Probability")
     _legend(ax)
 
@@ -279,7 +333,7 @@ def plot_density(
                 "ax is not attached to a figure. Pass an axes from "
                 "plt.subplots(), or omit ax to create a new figure."
             )
-        fig = figure
+        fig = cast("matplotlib.figure.Figure", figure)
         created = False
 
     kind = _density_kind(values)
@@ -352,7 +406,7 @@ def _select_draws(
                 selected = selected.sel(applicable)
             except KeyError as err:
                 available = {
-                    dim: [str(v) for v in selected.coords[dim].values]
+                    dim: [_coord_value(v) for v in selected.coords[dim].values]
                     for dim in applicable
                     if dim in selected.coords
                 }

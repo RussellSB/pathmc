@@ -19,7 +19,7 @@ import sys
 import warnings
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING, cast
 
 import arviz as az
 import graphviz
@@ -1027,7 +1027,7 @@ class PathModel:
                     "ax is not attached to a figure. Pass an axes from "
                     "plt.subplots(), or omit ax to create a new figure."
                 )
-            fig = figure
+            fig = cast("matplotlib.figure.Figure", figure)
             created = False
         for i, (label, draws) in enumerate(draws_by_name):
             plot_density(draws, label=label, ref=refs[i], color=colors[i], ax=target)

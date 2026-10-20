@@ -564,5 +564,48 @@ class TestCriticRegressions:
         x = np.asarray(fig.axes[0].lines[0].get_xdata(), dtype=float)
         y = np.asarray(fig.axes[0].lines[0].get_ydata(), dtype=float)
         assert abs(float(x[int(np.argmax(y))])) < 2
+        with pytest.raises(KeyError) as exc:
+            model.plot_dist("mu_y", coords={"time": "0", "unit": "A"})
+        available = str(exc.value).split("Available values:", 1)[1]
+        assert "[0, 1, 2]" in available
+        assert "'0'" not in available
+        selected = model.plot_dist("mu_y", coords={"time": 0, "unit": "A"})
+        assert "time=0" in _legend_text(selected)
         with pytest.raises(ValueError, match="y_predictors"):
             model.plot_dist("beta_y")
+
+    def test_point_mass_overlay_stays_inside_supplied_axes(self):
+        import matplotlib.pyplot as plt
+
+        for bars_first in (True, False):
+            fig, ax = plt.subplots()
+            bars = np.array([0, 1, 0, 1])
+            mass = np.full(8, 5.0)
+            if bars_first:
+                plot_density(bars, ax=ax)
+                plot_density(mass, ax=ax)
+            else:
+                plot_density(mass, ax=ax)
+                plot_density(bars, ax=ax)
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            ax_box = ax.get_window_extent(renderer)
+            text = ax.texts[0]
+            box = text.get_window_extent(renderer)
+            assert box.x0 >= ax_box.x0 - 1
+            assert box.x1 <= ax_box.x1 + 1
+            assert "point mass at 5" in text.get_text()
+            ticks = [float(tick) for tick in ax.get_xticks()]
+            assert any(abs(tick - 5) < 1e-6 for tick in ticks)
+            assert any(abs(tick) < 1e-6 for tick in ticks)
+            assert any(abs(tick - 1) < 1e-6 for tick in ticks)
+            plt.close(fig)
+
+    def test_cleared_axes_accepts_a_different_kind(self):
+        import matplotlib.pyplot as plt
+
+        _, ax = plt.subplots()
+        plot_density(np.linspace(0.0, 1.0, 30), ax=ax)
+        ax.clear()
+        plot_density(np.ones(10), ax=ax)
+        assert any("point mass" in text.get_text() for text in ax.texts)
