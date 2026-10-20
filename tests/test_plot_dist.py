@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
+import xarray as xr
 
 from pathmc.effects import EffectResult
 from pathmc.plotting import plot_density
-
+from pathmc.simulate import DoResult, EstimandResult
 from _draw_fixtures import do_result_from_flat, estimand_result_from_flat
 
 
@@ -29,6 +32,10 @@ def _agg_backend():
     import matplotlib
 
     matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    yield
+    plt.close("all")
 
 
 def _draws(n: int = 500) -> np.ndarray:
@@ -229,3 +236,225 @@ class TestPathModelPlotDist:
         model = pathmc.model(spec, data=mediation_data)
         with pytest.raises(RuntimeError, match="plot_dist"):
             model.plot_dist(var=["a"])
+
+
+def _legend_text(fig) -> str:
+    legend = fig.axes[0].get_legend()
+    assert legend is not None
+    return " ".join(text.get_text() for text in legend.get_texts())
+
+
+def _kde_mode(line) -> float:
+    x = np.asarray(line.get_xdata(), dtype=float)
+    y = np.asarray(line.get_ydata(), dtype=float)
+    return float(x[np.argmax(y)])
+
+
+def _has_open_interval_density(ax, lo: float, hi: float) -> bool:
+    """True when a non-vertical line puts positive density strictly inside (lo, hi)."""
+    for line in ax.lines:
+        x = np.asarray(line.get_xdata(), dtype=float)
+        y = np.asarray(line.get_ydata(), dtype=float)
+        if x.size == 0 or np.nanmax(x) - np.nanmin(x) < 1e-9:
+            continue
+        interior = (x > lo) & (x < hi) & np.isfinite(y) & (y > 0)
+        if interior.any():
+            return True
+    return False
+
+
+class TestPlotDensityDrawTypes:
+    def test_constant_draws_are_a_finite_point_mass(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fig = plot_density(np.ones(100), label="X")
+        assert not any("single value" in str(item.message) for item in caught)
+        ax = fig.axes[0]
+        assert any("point mass at 1" in text.get_text() for text in ax.texts)
+        ys = np.concatenate([
+            np.asarray(line.get_ydata(), dtype=float) for line in ax.lines
+        ])
+        assert np.isfinite(ys).all()
+        assert any(
+            np.all(np.asarray(line.get_xdata(), dtype=float) == 1.0)
+            for line in ax.lines
+        )
+
+    def test_integer_draws_have_no_density_between_support(self):
+        draws = np.array([0, 1, 1, 0, 1, 0, 0, 1], dtype=float)
+        fig = plot_density(draws, label="Y")
+        ax = fig.axes[0]
+        assert not _has_open_interval_density(ax, 0.0, 1.0)
+        centers = sorted(patch.get_x() + patch.get_width() / 2 for patch in ax.patches)
+        assert centers == pytest.approx([0.0, 1.0])
+        assert sum(patch.get_height() for patch in ax.patches) == pytest.approx(1.0)
+        assert ax.get_ylabel() == "Probability"
+
+
+def _time_split_result(cls):
+    noise = np.random.default_rng(7).normal(0, 0.25, (2, 100))
+    ds = xr.Dataset(
+        {"Y": (("time", "chain", "draw"), np.stack([-10 + noise, 10 + noise]))},
+        coords={"time": ["before", "after"]},
+    )
+    if cls is DoResult:
+        return DoResult(ds=ds)
+    return EstimandResult(ds=ds, outcome="Y", treatment="X", estimand="ATE")
+
+
+class TestTimeIndexedPlotDist:
+    @pytest.mark.parametrize("cls", [DoResult, EstimandResult])
+    def test_default_refuses_time_average(self, cls):
+        result = _time_split_result(cls)
+        with pytest.raises(ValueError, match="time_mean") as exc:
+            result.plot_dist(var="Y")
+        message = str(exc.value)
+        assert "by_time" in message
+        assert "average over time" in message
+        if cls is DoResult:
+            assert ".plot(" in message
+        else:
+            assert ".plot(" not in message
+
+    @pytest.mark.parametrize("cls", [DoResult, EstimandResult])
+    def test_time_mean_is_labeled_and_collapsed(self, cls):
+        fig = _time_split_result(cls).plot_dist(var="Y", aggregate="time_mean")
+        assert "time mean" in _legend_text(fig)
+        assert abs(_kde_mode(fig.axes[0].lines[0])) < 2
+
+    def test_time_coord_selects_one_period(self):
+        fig = _time_split_result(DoResult).plot_dist(var="Y", coords={"time": "before"})
+        assert "before" in _legend_text(fig)
+        assert _kde_mode(fig.axes[0].lines[0]) == pytest.approx(-10, abs=2)
+
+    def test_single_time_point_needs_no_aggregate(self):
+        draws = np.random.default_rng(1).normal(size=(1, 2, 20))
+        ds = xr.Dataset(
+            {"Y": (("time", "chain", "draw"), draws)},
+            coords={"time": ["only"]},
+        )
+        fig = DoResult(ds=ds).plot_dist()
+        assert _legend_text(fig) == "Y"
+
+
+def _two_unit_result() -> DoResult:
+    rng = np.random.default_rng(0)
+    data = np.stack(
+        [rng.normal(0, 0.25, (2, 40)), rng.normal(100, 0.25, (2, 40))],
+        axis=-1,
+    )
+    return DoResult(
+        ds=xr.Dataset(
+            {"Y": (("chain", "draw", "unit"), data)},
+            coords={"unit": ["A", "B"]},
+        )
+    )
+
+
+class TestUnitPlotDist:
+    def test_default_refuses_pooled_units(self):
+        with pytest.raises(ValueError, match="unit_pool") as exc:
+            _two_unit_result().plot_dist(var="Y")
+        assert "coords" in str(exc.value)
+
+    def test_unit_selector_plots_that_unit_only(self):
+        fig = _two_unit_result().plot_dist(var="Y", coords={"unit": "A"})
+        assert "unit=A" in _legend_text(fig)
+        x = np.asarray(fig.axes[0].lines[0].get_xdata(), dtype=float)
+        assert np.nanmax(np.abs(x)) < 5
+
+    def test_unit_pool_is_labeled_and_spans_both_groups(self):
+        fig = _two_unit_result().plot_dist(var="Y", aggregate="unit_pool")
+        assert "pooled over unit" in _legend_text(fig)
+        x = np.asarray(fig.axes[0].lines[0].get_xdata(), dtype=float)
+        assert x.min() < 5
+        assert x.max() > 90
+
+    def test_single_unit_needs_no_selector(self):
+        draws = np.random.default_rng(2).normal(size=(2, 10, 1))
+        ds = xr.Dataset(
+            {"Y": (("chain", "draw", "unit"), draws)},
+            coords={"unit": ["only"]},
+        )
+        fig = DoResult(ds=ds).plot_dist()
+        assert _legend_text(fig) == "Y"
+
+
+def _coord_model():
+    import arviz as az
+    import pandas as pd
+
+    import pathmc
+
+    frame = pd.DataFrame({
+        "X": [0.0, 1.0, 0.0, 1.0],
+        "M": [0.1, 0.2, 0.3, 0.4],
+        "Y": [1.0, 1.1, 0.9, 1.2],
+    })
+    model = pathmc.model("M ~ X\nY ~ M + X", data=frame)
+    beta_m = np.linspace(0.0, 1.0, 8).reshape(1, 8, 1)
+    beta_y = np.column_stack([
+        np.linspace(0.0, 1.0, 8),
+        np.linspace(10.0, 11.0, 8),
+    ]).reshape(1, 8, 2)
+    model._idata = az.from_dict(
+        {
+            "posterior": {
+                "beta_M": beta_m,
+                "beta_Y": beta_y,
+                "gamma": np.zeros((1, 4, 2, 3)),
+            }
+        },
+        coords={
+            "M_predictors": ["X"],
+            "Y_predictors": ["M", "X"],
+            "group": ["g0", "g1"],
+            "level": ["l0", "l1", "l2"],
+        },
+        dims={
+            "beta_M": ["M_predictors"],
+            "beta_Y": ["Y_predictors"],
+            "gamma": ["group", "level"],
+        },
+    )
+    return model
+
+
+class TestCoordinateSelection:
+    def test_size_one_dimension_needs_no_coords(self):
+        fig = _coord_model().plot_dist(var="beta_M")
+        assert "beta_M" in _legend_text(fig)
+
+    def test_empty_coords_does_not_bypass_multidim(self):
+        with pytest.raises(ValueError, match="multiple coordinates"):
+            _coord_model().plot_dist(var="beta_Y", coords={})
+
+    def test_partial_selector_does_not_pool_remaining_dim(self):
+        with pytest.raises(ValueError, match="multiple coordinates"):
+            _coord_model().plot_dist(var="gamma", coords={"group": "g0"})
+
+    def test_overlay_applies_only_matching_selectors(self):
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots()
+        out = _coord_model().plot_dist(
+            var=["beta_M", "beta_Y"],
+            coords={"M_predictors": "X", "Y_predictors": "X"},
+            ax=ax,
+        )
+        assert out is fig
+        assert len(ax.lines) == 2
+        legend = _legend_text(fig)
+        assert "beta_M" in legend
+        assert "beta_Y" in legend
+        assert "Y_predictors=X" in legend
+
+    def test_unused_selector_raises(self):
+        with pytest.raises(ValueError, match="did not match"):
+            _coord_model().plot_dist(var=["beta_M"], coords={"Y_predictors": "X"})
+
+    def test_effect_plot_dist_returns_figure(self):
+        import matplotlib.figure
+
+        fig = EffectResult("a", np.random.default_rng(3).normal(size=50)).plot_dist()
+        assert isinstance(fig, matplotlib.figure.Figure)

@@ -13,23 +13,28 @@
 #   limitations under the License.
 """Shared posterior-density rendering for models and result objects.
 
-Centralizes the KDE density plot behind ``plot_dist`` on
-:class:`~pathmc._model.PathModel`, :class:`~pathmc.effects.EffectResult`,
-:class:`~pathmc.simulate.EstimandResult`, and
-:class:`~pathmc.simulate.DoResult`. A leaf module so the model layer and
+Centralizes ``plot_dist`` on :class:`~pathmc._model.PathModel`,
+:class:`~pathmc.effects.EffectResult`, :class:`~pathmc.simulate.EstimandResult`,
+and :class:`~pathmc.simulate.DoResult`. A leaf module so the model layer and
 the result objects can both import it without cycles.
 
-The renderer returns a :class:`matplotlib.figure.Figure`, accepts an
-optional ``ax`` for composition, and imports matplotlib lazily inside the
-function.
+``plot_density`` returns a :class:`matplotlib.figure.Figure` and does not
+display it. Supported 1-D draw types:
+
+- continuous, non-constant: KDE curve and translucent fill
+- constant: a point mass at the unique value (ArviZ's KDE is undefined here)
+- integer-valued, non-constant: empirical probability bars on the observed
+  integers, with no density between them
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 import arviz as az
 import numpy as np
+import xarray as xr
 
 
 if TYPE_CHECKING:
@@ -37,6 +42,126 @@ if TYPE_CHECKING:
     import matplotlib.figure
 
 __all__ = ["plot_density"]
+
+_SAMPLE_DIMS = ("chain", "draw")
+_AGGREGATES = ("time_mean", "unit_pool")
+
+
+def _as_1d(draws: np.ndarray) -> np.ndarray:
+    """Return finite 1-D draws, or raise a message that names the fix."""
+    values = np.asarray(draws, dtype=float).reshape(-1)
+    if values.size == 0:
+        raise ValueError(
+            "draws is empty. Pass a 1-D array with at least one finite sample."
+        )
+    if not np.isfinite(values).all():
+        raise ValueError(
+            "draws contains non-finite values. Drop or impute them before plotting."
+        )
+    return values
+
+
+def _integer_valued(draws: np.ndarray) -> bool:
+    """True when every draw is an integer (Bernoulli, Poisson, and kin)."""
+    return bool(np.all(draws == np.round(draws)))
+
+
+def _legend(ax: matplotlib.axes.Axes) -> None:
+    handles, labels = ax.get_legend_handles_labels()
+    if labels:
+        ax.legend(loc="best")
+
+
+def _plot_point_mass(
+    ax: matplotlib.axes.Axes,
+    draws: np.ndarray,
+    *,
+    label: str | None,
+    color: str,
+) -> None:
+    """Mark a constant sample as a point mass instead of a blank KDE."""
+    value = float(draws[0])
+    fresh = not ax.has_data()
+    vline_kwargs: dict[str, Any] = {"color": color, "lw": 2}
+    if label is not None:
+        vline_kwargs["label"] = label
+    ax.axvline(value, **vline_kwargs)
+    ax.plot(
+        [value],
+        [1.0],
+        marker="o",
+        color=color,
+        ms=8,
+        linestyle="None",
+        label="_nolegend_",
+    )
+    ax.annotate(
+        f"point mass at {value:g} (n={draws.size})",
+        xy=(value, 1.0),
+        xytext=(6, -14),
+        textcoords="offset points",
+        ha="left",
+        va="top",
+        color=color,
+        fontsize=9,
+    )
+    if fresh:
+        ax.set_ylim(0, 1.15)
+    ax.set_ylabel("Probability")
+    _legend(ax)
+
+
+def _plot_discrete(
+    ax: matplotlib.axes.Axes,
+    draws: np.ndarray,
+    *,
+    label: str | None,
+    color: str,
+) -> None:
+    """Plot an empirical PMF. Bars sit on the observed integers only."""
+    values, counts = np.unique(draws, return_counts=True)
+    probs = counts / counts.sum()
+    if values.size == 1:
+        width = 0.8
+    else:
+        gaps = np.diff(values.astype(float))
+        width = float(min(0.8, np.min(gaps) * 0.8))
+    ax.bar(
+        values,
+        probs,
+        width=width,
+        align="center",
+        color=color,
+        alpha=0.6,
+        label=label if label is not None else "_nolegend_",
+    )
+    if values.size <= 20:
+        ax.set_xticks(values)
+    ax.set_ylabel("Probability")
+    _legend(ax)
+
+
+def _plot_kde(
+    ax: matplotlib.axes.Axes,
+    draws: np.ndarray,
+    *,
+    label: str | None,
+    color: str,
+) -> None:
+    # Constant arrays are handled before this call. ArviZ 1.2 ``az.kde``
+    # returns x=0 and non-finite y for those, which would draw a blank plot.
+    x_kde, y_kde, _ = az.kde(draws)
+    if not np.isfinite(x_kde).all() or not np.isfinite(y_kde).all():
+        raise ValueError(
+            "Could not compute a finite density for these draws "
+            f"(n={draws.size}, min={float(draws.min())}, max={float(draws.max())}). "
+            "Constant draws are drawn as a point mass and integer draws as a "
+            "probability mass function; report this if the draws are neither."
+        )
+    ax.plot(x_kde, y_kde, color=color, lw=2, label=label)
+    ax.fill_between(x_kde, y_kde, alpha=0.3, color=color)
+    ax.set_ylabel("Density")
+    _legend(ax)
 
 
 def plot_density(
@@ -47,15 +172,20 @@ def plot_density(
     ax: matplotlib.axes.Axes | None = None,
     color: str = "C0",
 ) -> matplotlib.figure.Figure:
-    """Plot a posterior density with an optional reference line.
+    """Plot a 1-D sample as a density, a point mass, or an integer PMF.
 
-    Draws a KDE curve with a translucent fill and a legend entry. Optionally
-    marks a reference value with a dashed vertical line.
+    Continuous non-constant draws use a KDE curve with a translucent fill.
+    Constant draws (including a fixed intervention) are a point mass at that
+    value: ArviZ's KDE is undefined for a single value and would otherwise
+    return a non-finite curve. Integer-valued draws, such as Bernoulli or
+    Poisson predictive samples, are empirical probability bars on the observed
+    integers, so the plot does not put mass between values the outcome cannot
+    take.
 
     Parameters
     ----------
     draws : np.ndarray
-        Flat ``(n_samples,)`` array of posterior draws.
+        Flat ``(n_samples,)`` array. Non-finite values are rejected.
     label : str | None
         Legend label. Omitted when ``None``.
     ref : float | None
@@ -64,28 +194,193 @@ def plot_density(
     ax : matplotlib.axes.Axes | None
         Axes to plot on. Creates a new figure if ``None``.
     color : str
-        Line and fill color (default ``"C0"``).
+        Line, marker, and fill color (default ``"C0"``).
 
     Returns
     -------
     matplotlib.figure.Figure
-        The figure containing the density plot.
+        The figure containing the plot. The caller displays or saves it.
+
+    Raises
+    ------
+    ValueError
+        If *draws* is empty, non-finite, or a continuous sample whose KDE
+        is non-finite.
     """
     import matplotlib.pyplot as plt
 
+    values = _as_1d(draws)
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 4))
     else:
         fig = cast("matplotlib.figure.Figure", ax.get_figure())
+        if fig is None:
+            raise ValueError(
+                "ax is not attached to a figure. Pass an axes from "
+                "plt.subplots(), or omit ax to create a new figure."
+            )
 
-    x_kde, y_kde, _ = az.kde(np.asarray(draws))
-    ax.plot(x_kde, y_kde, color=color, lw=2, label=label)
-    ax.fill_between(x_kde, y_kde, alpha=0.3, color=color)
+    if np.ptp(values) == 0:
+        _plot_point_mass(ax, values, label=label, color=color)
+    elif _integer_valued(values):
+        _plot_discrete(ax, values, label=label, color=color)
+    else:
+        _plot_kde(ax, values, label=label, color=color)
     if ref is not None:
         ax.axvline(ref, color=color, linestyle="--", linewidth=1.5)
-    handles, labels = ax.get_legend_handles_labels()
-    if labels:
-        ax.legend(loc="best")
-    ax.set_ylabel("Density")
     fig.tight_layout()
     return fig
+
+
+def _reject_unused_coords(
+    coords: Mapping[str, Any] | None,
+    applied: set[str],
+    names: Sequence[str],
+) -> None:
+    """Raise when a requested selector matched no selected variable."""
+    if not coords:
+        return
+    unused = [key for key in coords if key not in applied]
+    if unused:
+        raise ValueError(
+            f"coords keys {unused} did not match any dimension of {list(names)}. "
+            "Drop selectors that none of the selected variables have, or check "
+            "the coordinate names."
+        )
+
+
+def _select_draws(
+    da: xr.DataArray,
+    *,
+    name: str,
+    coords: Mapping[str, Any] | None = None,
+    aggregate: str | None = None,
+    time_inspection: str = "Inspect the per-time draws separately. ",
+) -> tuple[np.ndarray, str, set[str]]:
+    """Reduce *da* to a 1-D sample and a legend label.
+
+    Applies only *coords* keys that are dimensions of *da*. Size-1 non-sample
+    dimensions need no selector. Every remaining non-sample dimension of size
+    greater than 1 must be selected, except ``time`` and ``unit``, which
+    require an explicit aggregate instead of being silently collapsed.
+
+    Returns the flat draws, the legend label, and the coord keys that were
+    applied to this variable.
+    """
+    if aggregate not in (None, *_AGGREGATES):
+        raise ValueError(
+            f"Unknown aggregate={aggregate!r}. "
+            "Supported values: 'time_mean', 'unit_pool', or omit aggregate."
+        )
+
+    selected = da
+    applied: set[str] = set()
+    if coords:
+        applicable = {
+            key: value for key, value in coords.items() if key in selected.dims
+        }
+        if applicable:
+            try:
+                selected = selected.sel(applicable)
+            except KeyError as err:
+                available = {
+                    dim: [str(v) for v in selected.coords[dim].values]
+                    for dim in applicable
+                    if dim in selected.coords
+                }
+                raise KeyError(
+                    f"coords {applicable} did not match '{name}'. "
+                    f"Available values: {available}. "
+                    "Pass a coordinate value that exists on that dimension."
+                ) from err
+            applied = set(applicable)
+
+    label = name
+    selected_bits = [
+        f"{key}={value}"
+        for key, value in (coords or {}).items()
+        if key in applied and key not in _SAMPLE_DIMS
+    ]
+    if selected_bits:
+        label = f"{label} [{', '.join(selected_bits)}]"
+
+    n_times = int(selected.sizes["time"]) if "time" in selected.dims else 0
+    if n_times > 1 and aggregate != "time_mean":
+        times = [str(v) for v in selected.coords["time"].values]
+        shown = ", ".join(times[:6]) + ("" if len(times) <= 6 else ", ...")
+        ignored = (
+            "aggregate='unit_pool' does not collapse time. "
+            if aggregate == "unit_pool"
+            else ""
+        )
+        raise ValueError(
+            f"'{name}' has {n_times} time points ({shown}). "
+            "plot_dist() will not average over time and present that as the "
+            f"posterior of '{name}'. {ignored}{time_inspection.format(name=name)}"
+            "To plot the density of the time-averaged draws, pass "
+            "aggregate='time_mean' (the legend will mark it as a time mean)."
+        )
+    if aggregate == "time_mean" and n_times <= 1:
+        raise ValueError(
+            f"aggregate='time_mean' requires '{name}' to have more than one "
+            "time point. Omit aggregate when the variable is already univariate "
+            "in time."
+        )
+    if aggregate == "time_mean":
+        selected = selected.mean(dim="time")
+        label = f"{label} (time mean)"
+    elif "time" in selected.dims:
+        selected = selected.squeeze("time", drop=True)
+
+    n_units = int(selected.sizes["unit"]) if "unit" in selected.dims else 0
+    if n_units > 1 and aggregate != "unit_pool":
+        ignored = (
+            "aggregate='time_mean' does not select or pool units. "
+            if aggregate == "time_mean"
+            else ""
+        )
+        raise ValueError(
+            f"'{name}' has {n_units} units. plot_dist() will not pool them into "
+            f"one density labeled '{name}'. {ignored}"
+            "Select one unit with coords={'unit': <id>}, or pass "
+            "aggregate='unit_pool' to plot the pooled distribution "
+            "(the legend will say it is pooled over unit)."
+        )
+    if aggregate == "unit_pool" and n_units <= 1:
+        raise ValueError(
+            f"aggregate='unit_pool' requires '{name}' to have more than one "
+            "unit. Omit aggregate when the variable has no unit dimension, "
+            "or select the single unit implicitly by omitting coords."
+        )
+    if aggregate == "unit_pool":
+        label = f"{label} (pooled over unit)"
+    elif "unit" in selected.dims:
+        selected = selected.squeeze("unit", drop=True)
+
+    extra = [
+        dim
+        for dim in selected.dims
+        if dim not in (*_SAMPLE_DIMS, "unit", "time") and int(selected.sizes[dim]) > 1
+    ]
+    if extra:
+        hint = ", ".join(f"{dim!r}: '<value>'" for dim in extra)
+        raise ValueError(
+            f"'{name}' has multiple coordinates on dimension(s) {extra} "
+            "(size > 1) after selection. Pass coords to select one value on "
+            f"each remaining dimension, e.g. coords={{{hint}}}."
+        )
+    squeeze_dims = [
+        dim
+        for dim in selected.dims
+        if dim not in (*_SAMPLE_DIMS, "unit") and int(selected.sizes[dim]) <= 1
+    ]
+    if squeeze_dims:
+        selected = selected.squeeze(dim=squeeze_dims, drop=True)
+
+    stack_dims = [dim for dim in (*_SAMPLE_DIMS, "unit") if dim in selected.dims]
+    if stack_dims:
+        stacked = selected.stack(sample=stack_dims).transpose("sample")
+        flat = np.asarray(stacked.values).ravel()
+    else:
+        flat = np.asarray(selected.values).ravel()
+    return flat, label, applied

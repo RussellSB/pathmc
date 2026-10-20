@@ -23,6 +23,7 @@ import pathmc
 def test_top_level_public_api_is_explicit() -> None:
     assert pathmc.__all__ == [
         "AdjustmentModel",
+        "Basis",
         "TBFPC",
         "BuildModelFromDAG",
         "DoResult",
@@ -35,6 +36,8 @@ def test_top_level_public_api_is_explicit() -> None:
         "PathModel",
         "PlaceboRefutationResult",
         "Prior",
+        "Scaling",
+        "ScalingFactors",
         "SensitivityResult",
         "TestResult",
         "Transform",
@@ -43,9 +46,11 @@ def test_top_level_public_api_is_explicit() -> None:
         "datagrid",
         "model",
         "plot_density",
+        "register_basis",
         "register_transform",
         "same_markov_equivalence_class",
         "simulate",
+        "simulate_params_template",
     ]
 
 
@@ -69,6 +74,7 @@ def test_public_submodule_exports_are_intentional() -> None:
         "pathmc.priors": [],
         "pathmc.refute": ["PlaceboRefutationResult", "refute_placebo"],
         "pathmc.residuals": [],
+        "pathmc.scaling": ["Scaling", "ScalingFactors"],
         "pathmc.sensitivity": ["SensitivityResult"],
         "pathmc.simulate": ["DoResult", "EstimandResult"],
         "pathmc.transforms": [

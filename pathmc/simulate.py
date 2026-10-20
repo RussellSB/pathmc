@@ -25,10 +25,11 @@ handles temporal propagation natively.
 
 from __future__ import annotations
 
+import builtins
 import warnings
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import narwhals.stable.v1 as nw
 import numpy as np
@@ -47,8 +48,9 @@ from pathmc.idata import hdi as compute_hdi
 from pathmc.idata import hdi_label
 from pathmc.idata import posterior
 from pathmc.panel import PanelInfo
-from pathmc.plotting import plot_density
+from pathmc.plotting import _reject_unused_coords, _select_draws, plot_density
 from pathmc.reprs import ReprSpec, ResultReprMixin
+from pathmc.scaling import ScaleContext, ScalingFactors
 
 if TYPE_CHECKING:
     import matplotlib.axes
@@ -190,6 +192,47 @@ def _chain_draw_ones(post: xr.Dataset) -> xr.DataArray:
     return xr.ones_like(post["chain"] * post["draw"], dtype=float)
 
 
+def _to_business_units(
+    var: str,
+    da: xr.DataArray,
+    data: nw.DataFrame | None,
+    scaling_factors: ScalingFactors | None,
+    scan_info: Any | None = None,
+) -> xr.DataArray:
+    """Map internal-scale draws for *var* to business units."""
+    if scaling_factors is None:
+        return da
+    if data is None:
+        raise ValueError(
+            "scaling_factors requires data= so per-row divisors can be aligned."
+        )
+    return scaling_factors.to_business(
+        da,
+        kind="outcome",
+        dims=ScaleContext(
+            term=var,
+            data=data,
+            scan_info=scan_info,
+            scalar="mean",
+        ),
+    )
+
+
+def _unscale_do_dataset(
+    ds: xr.Dataset,
+    data: nw.DataFrame,
+    scaling_factors: ScalingFactors | None,
+) -> xr.Dataset:
+    """Return *ds* with scaled endogenous variables in business units."""
+    if scaling_factors is None:
+        return ds
+    return scaling_factors.to_business(
+        ds,
+        kind="outcome",
+        dims=ScaleContext(data=data, scalar="mean"),
+    )
+
+
 def _spread_over_time(
     ones: xr.DataArray, value: float | np.ndarray, time_index: np.ndarray
 ) -> xr.DataArray:
@@ -313,6 +356,28 @@ class _DrawStorageMixin:
                 "Use do(simulate_over='time') to get per-time results."
             )
         return self._draw_by_time(var)
+
+    def _plot_dist_var(
+        self,
+        key: str,
+        *,
+        coords: Mapping[str, Any] | None,
+        aggregate: Literal["time_mean", "unit_pool"] | None,
+        ref: float | None,
+        color: str,
+        ax: matplotlib.axes.Axes | None,
+        time_inspection: str,
+    ) -> matplotlib.figure.Figure:
+        """Plot one stored variable without silently collapsing time or unit."""
+        draws, label, applied = _select_draws(
+            self._ds[key],
+            name=key,
+            coords=coords,
+            aggregate=aggregate,
+            time_inspection=time_inspection,
+        )
+        _reject_unused_coords(coords, applied, [key])
+        return plot_density(draws, label=label, ref=ref, color=color, ax=ax)
 
 
 class DoResult(_DrawStorageMixin, ResultReprMixin):
@@ -450,20 +515,34 @@ class DoResult(_DrawStorageMixin, ResultReprMixin):
         self,
         var: str | None = None,
         *,
+        coords: Mapping[str, Any] | None = None,
+        aggregate: Literal["time_mean", "unit_pool"] | None = None,
         ref: float | None = None,
         color: str = "C0",
         ax: matplotlib.axes.Axes | None = None,
-    ) -> None:
+    ) -> matplotlib.figure.Figure:
         """Plot the posterior density of a stored variable.
 
         A result holding a single variable may omit *var*; a result holding
-        multiple variables requires explicit selection.
+        multiple variables requires explicit selection. A ``time`` dimension
+        with more than one point is not averaged, and a ``unit`` dimension
+        with more than one unit is not pooled, unless *aggregate* asks for
+        that collapse. Select one coordinate with *coords* instead when the
+        density at a single time or unit is the target.
 
         Parameters
         ----------
         var : str | None
             Variable to plot. Required when the result stores more than one
             variable; defaults to the single stored variable otherwise.
+        coords : Mapping[str, Any] | None
+            Coordinate selection, for example ``{"unit": "A"}``. Keys that are
+            not dimensions of the selected variable are an error.
+        aggregate : {'time_mean', 'unit_pool'} | None
+            Explicit collapse. ``"time_mean"`` plots the density of the
+            average over time and labels it as a time mean. ``"unit_pool"``
+            pools units into one density and labels that pooling. Omit to
+            require a univariate selection.
         ref : float | None
             Reference value marked with a dashed vertical line. No line when
             ``None``.
@@ -472,19 +551,32 @@ class DoResult(_DrawStorageMixin, ResultReprMixin):
         ax : matplotlib.axes.Axes | None
             Axes to plot on. Creates a new figure if ``None``.
 
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the density plot. Display is left to the caller.
+
         Raises
         ------
         KeyError
-            If *var* is not stored on this result.
+            If *var* is not stored on this result, or a coord value is missing.
         ValueError
-            If the result stores multiple variables and *var* is omitted.
+            If the result stores multiple variables and *var* is omitted, or
+            if the selected variable still has more than one time point or unit.
         """
         key = self._select_var(var)
-        plot_density(self._draw(key), label=key, ref=ref, color=color, ax=ax)
-        import matplotlib.pyplot as plt
-
-        if plt.get_backend().lower() != "agg":
-            plt.show()
+        return self._plot_dist_var(
+            key,
+            coords=coords,
+            aggregate=aggregate,
+            ref=ref,
+            color=color,
+            ax=ax,
+            time_inspection=(
+                "Inspect per-time draws with .by_time({name!r}), or plot the "
+                "trajectory with .plot({name!r}). "
+            ),
+        )
 
     def plot(
         self,
@@ -907,18 +999,31 @@ class EstimandResult(_DrawStorageMixin, ResultReprMixin):
         self,
         var: str | None = None,
         *,
+        coords: Mapping[str, Any] | None = None,
+        aggregate: Literal["time_mean", "unit_pool"] | None = None,
         ref: float | None = None,
         color: str = "C0",
         ax: matplotlib.axes.Axes | None = None,
-    ) -> None:
+    ) -> matplotlib.figure.Figure:
         """Plot the posterior density of a contrast variable.
 
-        Defaults to the outcome variable.
+        Defaults to the outcome variable. A ``time`` dimension with more than
+        one point is not averaged unless ``aggregate="time_mean"``. A per-time
+        trajectory is outside this method; use :meth:`by_time` to inspect the
+        time-indexed contrast.
 
         Parameters
         ----------
         var : str | None
             Variable name. Defaults to the outcome.
+        coords : Mapping[str, Any] | None
+            Coordinate selection. Keys that are not dimensions of the selected
+            variable are an error.
+        aggregate : {'time_mean', 'unit_pool'} | None
+            Explicit collapse. ``"time_mean"`` plots the density of the
+            average over time and labels it as a time mean. ``"unit_pool"``
+            pools units and labels that pooling. Omit to require a univariate
+            selection.
         ref : float | None
             Reference value marked with a dashed vertical line (e.g. ``0`` for a
             null contrast). No line when ``None``.
@@ -927,17 +1032,31 @@ class EstimandResult(_DrawStorageMixin, ResultReprMixin):
         ax : matplotlib.axes.Axes | None
             Axes to plot on. Creates a new figure if ``None``.
 
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the density plot. Display is left to the caller.
+
         Raises
         ------
         KeyError
-            If *var* is not stored on this result.
+            If *var* is not stored on this result, or a coord value is missing.
+        ValueError
+            If the selected variable still has more than one time point or unit.
         """
         key = self._resolve(var)
-        plot_density(self._draw(key), label=key, ref=ref, color=color, ax=ax)
-        import matplotlib.pyplot as plt
-
-        if plt.get_backend().lower() != "agg":
-            plt.show()
+        return self._plot_dist_var(
+            key,
+            coords=coords,
+            aggregate=aggregate,
+            ref=ref,
+            color=color,
+            ax=ax,
+            time_inspection=(
+                "Inspect per-time draws with .by_time({name!r}). "
+                "plot_dist() does not draw a per-time trajectory. "
+            ),
+        )
 
     def __float__(self) -> float:
         """Posterior mean of the estimand (outcome variable)."""
@@ -1288,6 +1407,43 @@ def _intervention_array(val: float | np.ndarray, n: int) -> np.ndarray:
     )
 
 
+def _scale_cross_section_intervention(
+    var: str,
+    arr: np.ndarray,
+    data: nw.DataFrame,
+    scaling_factors: ScalingFactors | None,
+) -> np.ndarray:
+    """Divide a length-n intervention by the column's per-row scale factors."""
+    if scaling_factors is None:
+        return arr
+    return np.asarray(
+        scaling_factors.to_internal(
+            arr,
+            kind="regressor",
+            dims=ScaleContext(term=var, data=data),
+        )
+    )
+
+
+def _scale_scan_intervention(
+    var: str,
+    mat: np.ndarray,
+    data: nw.DataFrame,
+    scan_info: Any,
+    scaling_factors: ScalingFactors | None,
+) -> np.ndarray:
+    """Divide a ``(n_times, n_units)`` intervention by scan-aligned factors."""
+    if scaling_factors is None:
+        return mat
+    return np.asarray(
+        scaling_factors.to_internal(
+            mat,
+            kind="regressor",
+            dims=ScaleContext(term=var, data=data, scan_info=scan_info),
+        )
+    )
+
+
 def _broadcast_intervention(
     ones: xr.DataArray, val: float | np.ndarray, n: int
 ) -> xr.DataArray:
@@ -1307,16 +1463,28 @@ def _as_unit_dim(mu: xr.DataArray) -> xr.DataArray:
     return mu.rename({obs[0]: "unit"})
 
 
-def _exog_value(
-    var: str, data: nw.DataFrame, subgroup_indices: np.ndarray | None
+def _business_exog_value(
+    var: str,
+    data: nw.DataFrame,
+    subgroup_indices: np.ndarray | None,
+    scaling_factors: ScalingFactors | None,
 ) -> float:
-    """Empirical fill for an exogenous variable, restricted to a subgroup."""
+    """Empirical fill for an exogenous variable in business units."""
     if var not in data.columns:
         return 0.0
-    col = data[var].to_numpy()
+    values = np.asarray(data[var].to_numpy(), dtype=float)
+    if scaling_factors is not None:
+        values = np.asarray(
+            scaling_factors.to_business(
+                values,
+                kind="regressor",
+                dims=ScaleContext(term=var, data=data),
+            ),
+            dtype=float,
+        )
     if subgroup_indices is not None:
-        col = col[subgroup_indices]
-    return _exogenous_fill(col)
+        values = values[subgroup_indices]
+    return _exogenous_fill(values)
 
 
 def run_do_pymc(
@@ -1329,6 +1497,8 @@ def run_do_pymc(
     families: dict[str, str] | None = None,
     subgroup_indices: np.ndarray | None = None,
     average_units: bool = True,
+    scaling_factors: ScalingFactors | None = None,
+    categorical_vars: set[str] | None = None,
 ) -> DoResult:
     """Run the do-operator using PyMC-native graph surgery.
 
@@ -1366,6 +1536,10 @@ def run_do_pymc(
     average_units : bool
         When ``True`` (default), average response means over observation
         rows for g-computation. When ``False``, keep a ``unit`` dim.
+    scaling_factors : ScalingFactors | None
+        Fitted scale factors. When given, ``set`` values for scaled
+        columns are treated as business units and divided by the
+        per-row factor before graph surgery.
 
     Returns
     -------
@@ -1377,28 +1551,30 @@ def run_do_pymc(
         set = {}
     if families is None:
         families = {}
+    if categorical_vars is None:
+        categorical_vars = builtins.set()
 
     N = len(data)
     latent = graph_info.latent
 
-    free_rv_names = {rv.name for rv in gen_model.free_RVs}
-    det_names_set = {d.name for d in gen_model.deterministics}
-
-    block_vars = {
-        var
-        for var in graph_info.topological_order
-        if var in graph_info.endogenous
-        and var not in free_rv_names
-        and var not in latent
-        and f"mu_{var}" in det_names_set
-    }
+    block_vars = {v for block in graph_info.residual_blocks for v in block}
 
     replacements: dict[str, Any] = {}
+    data_basis_bindings = getattr(gen_model, "_pathmc_data_bases", {})
     for var, val in set.items():
         key = f"mu_{var}" if (var in latent or var in block_vars) else var
-        arr = _intervention_array(val, N)
+        arr = _scale_cross_section_intervention(
+            var, _intervention_array(val, N), data, scaling_factors
+        )
         target_dtype = gen_model[key].dtype
         replacements[key] = arr.astype(target_dtype)
+        if data_basis_bindings:
+            from pathmc.basis import replay_data_bases
+
+            for data_name, columns in replay_data_bases(
+                data_basis_bindings, {var: arr}
+            ).items():
+                replacements[data_name] = columns.astype(gen_model[data_name].dtype)
 
     if kind == "mean":
         with _forced_generative_carry(gen_model):
@@ -1451,11 +1627,16 @@ def run_do_pymc(
             if var in set:
                 data_vars[var] = _broadcast_intervention(ones, set[var], N)
             elif var in graph_info.exogenous:
-                data_vars[var] = ones * _exog_value(var, data, subgroup_indices)
+                if var in categorical_vars:
+                    continue
+                data_vars[var] = ones * _business_exog_value(
+                    var, data, subgroup_indices, scaling_factors
+                )
             else:
                 mu = _apply_inverse_link(
                     det[mean_det_names[var]], families.get(var, "")
                 )
+                mu = _to_business_units(var, mu, data, scaling_factors)
                 if subgroup_indices is not None:
                     mu = mu.isel({_obs_dims(mu)[0]: subgroup_indices})
                 if average_units:
@@ -1498,8 +1679,13 @@ def run_do_pymc(
         if var in set:
             predictive_vars[var] = _broadcast_intervention(ones, set[var], N)
         elif var in graph_info.exogenous:
-            predictive_vars[var] = ones * _exog_value(var, data, subgroup_indices)
+            if var in categorical_vars:
+                continue
+            predictive_vars[var] = ones * _business_exog_value(
+                var, data, subgroup_indices, scaling_factors
+            )
         elif (src := _predictive_source(ppc, extra_det, var)) is not None:
+            src = _to_business_units(var, src, data, scaling_factors)
             if subgroup_indices is not None:
                 src = src.isel({_obs_dims(src)[0]: subgroup_indices})
             # Each row is its own draw: keep them on a ``unit`` axis that
@@ -1508,6 +1694,43 @@ def run_do_pymc(
             predictive_vars[var] = src.rename({obs[0]: "unit"}) if obs else src
 
     return DoResult(ds=xr.Dataset(predictive_vars))
+
+
+def _panel_predictive_sample_kwargs(
+    do_model: pm.Model,
+    graph_info: GraphInfo,
+    set: dict[str, float | np.ndarray],
+) -> dict[str, Any]:
+    """Keyword args for ``sample_posterior_predictive`` on intervened scan panels.
+
+    Masked panel outcomes split into ``{var}_observed`` and
+    ``{var}_unobserved`` free RVs. After ``pm.do()`` changes upstream
+    nodes, PyMC freezes the unobserved imputations unless they are listed
+    in ``sample_vars``. We resample every ``*_unobserved`` imputation RV in
+    the do-model, not only those downstream of the intervention, so
+    predictive draws stay consistent with the intervened generative graph.
+    Requesting only ``sample_vars`` drops the merged outcome from
+    ``posterior_predictive``, so ``var_names`` must name the non-latent
+    endogenous variables we still read from the PPC output. Latents not
+    in ``set`` are excluded from ``var_names`` and recovered through
+    ``compute_deterministics`` with the fitted posterior (including
+    ``innovations_{var}`` for stochastic latents), not fresh process noise.
+    """
+    if not set:
+        return {}
+    unobs = [rv.name for rv in do_model.free_RVs if rv.name.endswith("_unobserved")]
+    if not unobs:
+        return {}
+    var_names = [
+        var
+        for var in graph_info.topological_order
+        if var in graph_info.endogenous
+        and var not in set
+        and var not in graph_info.latent
+    ]
+    if not var_names:
+        return {"sample_vars": unobs}
+    return {"sample_vars": unobs, "var_names": var_names}
 
 
 def run_do_panel_unified(
@@ -1520,6 +1743,8 @@ def run_do_panel_unified(
     kind: str = "mean",
     families: dict[str, str] | None = None,
     observed_by_time: Mapping[str, np.ndarray] | None = None,
+    data: nw.DataFrame | None = None,
+    scaling_factors: ScalingFactors | None = None,
 ) -> DoResult:
     """Run the do-operator on a scan-compiled panel model.
 
@@ -1548,6 +1773,13 @@ def run_do_panel_unified(
         Per-variable distribution families.
     observed_by_time : Mapping[str, np.ndarray] | None
         Unit-mean observed series per variable for trajectory overlays.
+    data : nw.DataFrame | None
+        Fitted panel frame (row order matching ``scan_info.sort_idx``).
+        Required when *scaling_factors* is given.
+    scaling_factors : ScalingFactors | None
+        Fitted scale factors. When given, ``set`` values for scaled
+        columns are treated as business units and divided by the
+        scan-aligned factor before graph surgery.
     """
     if set is None:
         set = {}
@@ -1558,6 +1790,9 @@ def run_do_panel_unified(
     n_times = scan_info.n_times
     n_units = scan_info.n_units
     latent = graph_info.latent
+    stochastic_latent = {
+        v for v in latent if families.get(v, "gaussian") == "latent_normal"
+    }
 
     replacements: dict[str, Any] = {}
     scan_intervene_updates: dict[str, np.ndarray] = {}
@@ -1566,11 +1801,21 @@ def run_do_panel_unified(
             mat = np.broadcast_to(val[:, None], (n_times, n_units)).copy()
         else:
             mat = np.full((n_times, n_units), val)
+        if scaling_factors is not None:
+            if data is None:
+                raise ValueError(
+                    "scaling_factors requires data= so per-unit divisors "
+                    "can be aligned to the scan layout."
+                )
+            mat = _scale_scan_intervention(var, mat, data, scan_info, scaling_factors)
         # Outer graph-surgery replacement, as before: needed so the
         # intervened var is no longer a free RV that compute_deterministics /
         # sample_posterior_predictive must bind from the posterior (the
         # fitted idata never sampled it -- it is observed during fit()).
-        key = f"mu_{var}" if var in latent else var
+        if var in latent and var not in stochastic_latent:
+            key = f"mu_{var}"
+        else:
+            key = var
         target_dtype = gen_model[key].dtype
         replacements[key] = mat.astype(target_dtype)
         if var in graph_info.endogenous:
@@ -1590,13 +1835,9 @@ def run_do_panel_unified(
             if var in graph_info.endogenous and var not in set and var not in latent:
                 replacements[var] = gen_model[f"mu_{var}"] * 1
 
-        stochastic_latent = {
-            v for v in latent if families.get(v, "gaussian") == "latent_normal"
-        }
-
         det_names = []
         for var in graph_info.topological_order:
-            if var in graph_info.endogenous:
+            if var in graph_info.endogenous and var not in set:
                 if var in stochastic_latent:
                     det_names.append(var)
                 else:
@@ -1629,7 +1870,14 @@ def run_do_panel_unified(
                 data_vars[var] = ones * 0.0
             elif var in graph_info.endogenous:
                 det_key = var if var in stochastic_latent else f"mu_{var}"
-                data_vars[var] = _panel_unit_mean(det[det_key], time_idx)
+                raw = _to_business_units(
+                    var,
+                    det[det_key],
+                    data,
+                    scaling_factors,
+                    scan_info,
+                )
+                data_vars[var] = _panel_unit_mean(raw, time_idx)
 
         return DoResult(
             ds=xr.Dataset(data_vars),
@@ -1637,9 +1885,6 @@ def run_do_panel_unified(
         )
 
     # kind == "predictive"
-    stochastic_latent = {
-        v for v in latent if families.get(v, "gaussian") == "latent_normal"
-    }
     latent_det_names = []
     for var in graph_info.topological_order:
         if var in latent and var not in set:
@@ -1655,7 +1900,11 @@ def run_do_panel_unified(
                 "ignore", message="Could not extract data from symbolic observation"
             )
             with do_model:
-                ppc = pm.sample_posterior_predictive(idata, progressbar=False)
+                ppc = pm.sample_posterior_predictive(
+                    idata,
+                    progressbar=False,
+                    **_panel_predictive_sample_kwargs(do_model, graph_info, set),
+                )
 
         if latent_det_names:
             latent_det = pm.compute_deterministics(
@@ -1679,13 +1928,25 @@ def run_do_panel_unified(
         elif var in graph_info.exogenous:
             predictive_vars[var] = ones * 0.0
         elif var in ppc.posterior_predictive:
-            predictive_vars[var] = _panel_unit_mean(
-                ppc.posterior_predictive[var], time_idx
+            raw = _to_business_units(
+                var,
+                ppc.posterior_predictive[var],
+                data,
+                scaling_factors,
+                scan_info,
             )
+            predictive_vars[var] = _panel_unit_mean(raw, time_idx)
         elif latent_det is not None:
             det_key = var if var in stochastic_latent else f"mu_{var}"
             if det_key in latent_det:
-                predictive_vars[var] = _panel_unit_mean(latent_det[det_key], time_idx)
+                raw = _to_business_units(
+                    var,
+                    latent_det[det_key],
+                    data,
+                    scaling_factors,
+                    scan_info,
+                )
+                predictive_vars[var] = _panel_unit_mean(raw, time_idx)
 
     return DoResult(
         ds=xr.Dataset(predictive_vars),

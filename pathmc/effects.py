@@ -30,12 +30,14 @@ import pandas as pd
 import xarray as xr
 
 from pathmc.idata import DEFAULT_HDI_PROB, beta_draws, hdi, hdi_label
-from pathmc.parse import Spec
+from pathmc.parse import Spec, Term
 from pathmc.plotting import plot_density
 from pathmc.reprs import ReprSpec, ResultReprMixin
+from pathmc.scaling import ScaleContext, ScalingFactors
 
 if TYPE_CHECKING:
     import matplotlib.axes
+    import matplotlib.figure
 
 __all__ = ["EffectResult"]
 
@@ -119,7 +121,7 @@ class EffectResult(ResultReprMixin):
         ref: float | None = None,
         color: str = "C0",
         ax: matplotlib.axes.Axes | None = None,
-    ) -> None:
+    ) -> matplotlib.figure.Figure:
         """Plot the posterior density of the effect.
 
         Parameters
@@ -131,12 +133,13 @@ class EffectResult(ResultReprMixin):
             Line and fill color (default ``"C0"``).
         ax : matplotlib.axes.Axes | None
             Axes to plot on. Creates a new figure if ``None``.
-        """
-        plot_density(self.draws, label=self.name, ref=ref, color=color, ax=ax)
-        import matplotlib.pyplot as plt
 
-        if plt.get_backend().lower() != "agg":
-            plt.show()
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the density plot. Display is left to the caller.
+        """
+        return plot_density(self.draws, label=self.name, ref=ref, color=color, ax=ax)
 
     def _repr_compact(self) -> str:
         lo, hi = self.hdi()
@@ -251,9 +254,47 @@ def evaluate_defined_params(
     return defined_draws
 
 
+def _term_coefficient_scale(
+    term: Term,
+    outcome: str,
+    scaling_factors: ScalingFactors,
+    data: nw.DataFrame,
+) -> float:
+    """Internal-to-business multiplier for one regression coefficient.
+
+    Linear and adstock terms use ``f_out / f_pred``. Unitless regressors
+    (logistic saturation, HSGP) use ``f_out`` alone. Interactions use
+    ``f_out / prod(f_pred_i)``.
+    """
+    return float(
+        scaling_factors.to_business(
+            1.0,
+            kind="coefficient",
+            dims=ScaleContext(term=term, outcome=outcome, data=data),
+        )
+    )
+
+
+def _labeled_coef_business_scale(
+    spec: Spec,
+    label: str,
+    scaling_factors: ScalingFactors,
+    data: nw.DataFrame,
+) -> float:
+    """Map a labeled coefficient from internal to business units."""
+    for reg in spec.regressions:
+        for term in reg.terms:
+            if term.label != label:
+                continue
+            return _term_coefficient_scale(term, reg.lhs, scaling_factors, data)
+    return 1.0
+
+
 def build_effects_summary(
     spec: Spec,
     idata: xr.DataTree,
+    scaling_factors: ScalingFactors | None = None,
+    data: nw.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a summary DataFrame of labeled coefficients and defined parameters.
 
@@ -270,6 +311,20 @@ def build_effects_summary(
         Summary with mean, sd, hdi_3%, hdi_97% for each effect.
     """
     labeled_draws = extract_labeled_draws(spec, idata)
+    if scaling_factors is not None and data is not None:
+        converted: dict[str, np.ndarray] = {}
+        for reg in spec.regressions:
+            for term in reg.terms:
+                if term.label is None or term.label not in labeled_draws:
+                    continue
+                converted[term.label] = np.asarray(
+                    scaling_factors.to_business(
+                        labeled_draws[term.label],
+                        kind="coefficient",
+                        dims=ScaleContext(term=term, outcome=reg.lhs, data=data),
+                    )
+                )
+        labeled_draws = converted
     defined_draws = evaluate_defined_params(spec, labeled_draws)
 
     all_draws = {**labeled_draws, **defined_draws}
@@ -431,6 +486,8 @@ def compute_path_effect(
     spec: Spec,
     idata: xr.DataTree,
     families: dict[str, str] | None = None,
+    scaling_factors: ScalingFactors | None = None,
+    data: nw.DataFrame | None = None,
 ) -> EffectResult:
     """Compute the effect along a specified causal path.
 
@@ -529,6 +586,18 @@ def compute_path_effect(
             coord_name = f"{target}_predictors"
             draws = beta_draws(idata, beta_name, coord_name, source)
 
+        if scaling_factors is not None and data is not None:
+            draws = np.asarray(
+                scaling_factors.to_business(
+                    draws,
+                    kind="coefficient",
+                    dims=ScaleContext(
+                        term=matched_term,
+                        outcome=target,
+                        data=data,
+                    ),
+                )
+            )
         edge_draws.append(draws)
 
     result_draws = edge_draws[0]
