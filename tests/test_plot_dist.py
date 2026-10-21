@@ -601,6 +601,59 @@ class TestCriticRegressions:
             assert any(abs(tick - 1) < 1e-6 for tick in ticks)
             plt.close(fig)
 
+    def test_point_mass_label_follows_later_artists(self):
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        def assert_inside(fig: matplotlib.figure.Figure) -> None:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            ax = fig.axes[0]
+            ax_box = ax.get_window_extent(renderer)
+            labels = [text for text in ax.texts if "point mass" in text.get_text()]
+            assert labels
+            for text in labels:
+                box = text.get_window_extent(renderer)
+                assert box.x0 >= ax_box.x0 - 1, text.get_text()
+                assert box.x1 <= ax_box.x1 + 1, text.get_text()
+
+        for mass, bars in (
+            (np.full(8, -2.0), np.array([0, 1, 0, 1])),
+            (np.full(8, 5.0), np.array([10, 11, 10, 11])),
+        ):
+            fig, ax = plt.subplots()
+            plot_density(mass, ax=ax)
+            plot_density(bars, ax=ax)
+            assert_inside(fig)
+            plt.close(fig)
+
+        fig, ax = plt.subplots()
+        plot_density(np.full(8, -2.0), ref=0, ax=ax)
+        assert_inside(fig)
+        plt.close(fig)
+
+        fig, ax = plt.subplots()
+        EffectResult(name="const", draws=np.full(8, -2.0)).plot_dist(ref=0, ax=ax)
+        assert_inside(fig)
+        plt.close(fig)
+
+        fig, ax = plt.subplots()
+        plot_density(np.zeros(8), ax=ax)
+        plot_density(np.full(8, 5.0), ax=ax)
+        assert_inside(fig)
+        plt.close(fig)
+
+        model = _coord_model()
+        model._idata.posterior["const"] = xr.DataArray(
+            np.full((1, 8), -2.0),
+            dims=("chain", "draw"),
+        )
+        model._idata.posterior["counts"] = xr.DataArray(
+            np.tile([0.0, 1.0], 4).reshape(1, 8),
+            dims=("chain", "draw"),
+        )
+        assert_inside(model.plot_dist(["const", "counts"]))
+
     def test_cleared_axes_accepts_a_different_kind(self):
         import matplotlib.pyplot as plt
 

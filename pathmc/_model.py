@@ -91,6 +91,7 @@ from pathmc.parse import Spec, parse_spec
 from pathmc.plotting import (
     _label_scan_axes,
     _reject_unused_coords,
+    _reposition_point_mass_labels,
     _select_draws,
     plot_density,
 )
@@ -1033,6 +1034,7 @@ class PathModel:
             plot_density(draws, label=label, ref=refs[i], color=colors[i], ax=target)
         if created:
             fig.tight_layout()
+        _reposition_point_mass_labels(target)
         return fig
 
     def standardized(self) -> pd.DataFrame:

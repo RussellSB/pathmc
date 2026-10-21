@@ -45,6 +45,7 @@ __all__ = ["plot_density"]
 
 _SAMPLE_DIMS = ("chain", "draw")
 _AGGREGATES = ("time_mean", "unit_pool")
+_POINT_MASS_LABEL = "_pathmc_point_mass"
 
 
 def _as_1d(draws: np.ndarray) -> np.ndarray:
@@ -160,6 +161,57 @@ def _sync_probability_ticks(ax: matplotlib.axes.Axes) -> None:
     ax.set_xticks(unique)
 
 
+def _point_mass_labels(ax: matplotlib.axes.Axes) -> list[Any]:
+    return [text for text in ax.texts if getattr(text, _POINT_MASS_LABEL, False)]
+
+
+def _label_inside_axes(box: Any, ax_box: Any) -> bool:
+    return box.x0 >= ax_box.x0 - 1 and box.x1 <= ax_box.x1 + 1
+
+
+def _reposition_point_mass_labels(ax: matplotlib.axes.Axes) -> None:
+    """Move point-mass text inside the axes after later artists change xlim.
+
+    A label placed against the limits at draw time stays put when a later
+    series, reference line, or tight_layout moves that point toward an edge.
+    ``clip_on`` would then hide the value instead of keeping it readable.
+    """
+    labels = _point_mass_labels(ax)
+    figure = ax.figure
+    if not labels or figure is None:
+        return
+    figure.canvas.draw()
+    renderer = cast(Any, figure.canvas).get_renderer()
+    left, right = ax.get_xlim()
+    for ann in labels:
+        value = float(ann.xy[0])
+        if (value - left) >= (right - value):
+            sides = ((-6, "right"), (6, "left"))
+        else:
+            sides = ((6, "left"), (-6, "right"))
+        placed = False
+        for offset, ha in sides:
+            ann.xyann = (offset, -14)
+            ann.set_ha(ha)
+            figure.canvas.draw()
+            box = ann.get_window_extent(renderer)
+            ax_box = ax.get_window_extent(renderer)
+            if _label_inside_axes(box, ax_box):
+                placed = True
+                break
+        if placed:
+            continue
+        box = ann.get_window_extent(renderer)
+        ax_box = ax.get_window_extent(renderer)
+        dx_px = 0.0
+        if box.x0 < ax_box.x0:
+            dx_px = (ax_box.x0 - box.x0) + 1
+        elif box.x1 > ax_box.x1:
+            dx_px = (ax_box.x1 - box.x1) - 1
+        ann.xyann = (float(ann.xyann[0]) + dx_px * 72.0 / figure.dpi, -14)
+    figure.canvas.draw()
+
+
 def _place_point_mass_label(
     ax: matplotlib.axes.Axes,
     value: float,
@@ -167,25 +219,19 @@ def _place_point_mass_label(
     *,
     color: str,
 ) -> None:
-    """Put the point-mass annotation inside the axes, not in the margin."""
-    ax.relim()
-    ax.autoscale_view()
-    left, right = ax.get_xlim()
-    if value >= (left + right) / 2:
-        offset, ha = (-6, "right")
-    else:
-        offset, ha = (6, "left")
-    ax.annotate(
+    """Create the point-mass annotation. Final placement is a later pass."""
+    ann = ax.annotate(
         text,
         xy=(value, 1.0),
-        xytext=(offset, -14),
+        xytext=(6, -14),
         textcoords="offset points",
-        ha=ha,
+        ha="left",
         va="top",
         color=color,
         fontsize=9,
-        clip_on=True,
+        clip_on=False,
     )
+    setattr(ann, _POINT_MASS_LABEL, True)
 
 
 def _plot_point_mass(
@@ -306,7 +352,7 @@ def plot_density(
     ax : matplotlib.axes.Axes | None
         Axes to plot on. Creates a new figure if ``None``.
     color : str
-        Line, marker, and fill color (default ``"C0"``).
+        Line and fill color (default ``"C0"``).
 
     Returns
     -------
@@ -351,6 +397,7 @@ def plot_density(
     # move those siblings.
     if created:
         fig.tight_layout()
+    _reposition_point_mass_labels(target)
     return fig
 
 
