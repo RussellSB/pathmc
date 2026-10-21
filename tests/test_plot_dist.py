@@ -674,6 +674,24 @@ class TestCriticRegressions:
         returned = plot_density(np.full(8, -2.0), ax=closed_ax)
         assert returned is closed
 
+    def test_point_mass_does_not_move_a_pinned_sibling(self):
+        import matplotlib.pyplot as plt
+
+        pin = (0.7, 0.2, 0.2, 0.6)
+        for layout in ("tight", "constrained"):
+            fig, axes = plt.subplots(1, 2, layout=layout)
+            fig.canvas.draw()
+            axes[1].set_position(pin)
+            plot_density(np.full(8, -2.0), ax=axes[0])
+            assert axes[1].get_position().bounds == pytest.approx(pin)
+            plt.close(fig)
+
+            fig, axes = plt.subplots(1, 2, layout=layout)
+            before = axes[1].get_position().bounds
+            plot_density(np.full(8, -2.0), ax=axes[0])
+            assert axes[1].get_position().bounds == pytest.approx(before)
+            plt.close(fig)
+
     def test_cleared_axes_accepts_a_different_kind(self):
         import matplotlib.pyplot as plt
 

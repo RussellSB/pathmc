@@ -169,19 +169,17 @@ def _label_inside_axes(box: Any, ax_box: Any) -> bool:
     return box.x0 >= ax_box.x0 - 1 and box.x1 <= ax_box.x1 + 1
 
 
-def _optional_renderer(figure: Any) -> Any | None:
-    """Return a renderer, or None on PDF, SVG, PS, and closed figures.
+def _measure_renderer(figure: Any) -> Any:
+    """Measure text without drawing *figure*.
 
-    Those canvases have no ``get_renderer``. Calling it crashed constant
-    draws while KDE and bar plots still returned a figure.
+    ``canvas.draw()`` runs a tight or constrained layout engine and moves
+    axes the caller already placed. A private Agg renderer matches the
+    canvas size and does not.
     """
-    getter = getattr(figure.canvas, "get_renderer", None)
-    if not callable(getter):
-        return None
-    try:
-        return getter()
-    except AttributeError:
-        return None
+    from matplotlib.backends.backend_agg import RendererAgg
+
+    width, height = figure.canvas.get_width_height()
+    return RendererAgg(int(width), int(height), float(figure.dpi))
 
 
 def _set_point_mass_side(ann: Any, *, offset: float, ha: str) -> None:
@@ -194,9 +192,9 @@ def _reposition_point_mass_labels(ax: matplotlib.axes.Axes) -> None:
 
     A label placed against the limits at draw time stays put when a later
     series, reference line, or tight_layout moves that point toward an edge.
-    The side comes from those final limits, so a canvas without a renderer
-    still returns a figure. Pixel measurement only nudges a label that is
-    still outside, and only when a renderer exists.
+    The side comes from those final limits. Pixel measurement uses a private
+    renderer, so a supplied axes does not run the figure layout engine and a
+    canvas without ``get_renderer`` still returns a figure.
     """
     labels = _point_mass_labels(ax)
     figure = ax.figure
@@ -209,10 +207,7 @@ def _reposition_point_mass_labels(ax: matplotlib.axes.Axes) -> None:
             _set_point_mass_side(ann, offset=-6, ha="right")
         else:
             _set_point_mass_side(ann, offset=6, ha="left")
-    renderer = _optional_renderer(figure)
-    if renderer is None:
-        return
-    figure.canvas.draw()
+    renderer = _measure_renderer(figure)
     for ann in labels:
         box = ann.get_window_extent(renderer)
         ax_box = ax.get_window_extent(renderer)
@@ -222,7 +217,6 @@ def _reposition_point_mass_labels(ax: matplotlib.axes.Axes) -> None:
             _set_point_mass_side(ann, offset=6, ha="left")
         else:
             _set_point_mass_side(ann, offset=-6, ha="right")
-        figure.canvas.draw()
         box = ann.get_window_extent(renderer)
         ax_box = ax.get_window_extent(renderer)
         if _label_inside_axes(box, ax_box):
@@ -233,7 +227,6 @@ def _reposition_point_mass_labels(ax: matplotlib.axes.Axes) -> None:
         elif box.x1 > ax_box.x1:
             dx_px = (ax_box.x1 - box.x1) - 1
         ann.xyann = (float(ann.xyann[0]) + dx_px * 72.0 / figure.dpi, -14)
-    figure.canvas.draw()
 
 
 def _place_point_mass_label(
