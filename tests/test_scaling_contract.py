@@ -1125,6 +1125,58 @@ def test_plot_dist_skips_unscalable_labels_it_did_not_request(mock_pymc_sample):
         REGISTRY.pop("hillish", None)
 
 
+def test_plot_dist_uses_a_label_its_own_parameter_has_not_overwritten(
+    mock_pymc_sample,
+):
+    x = np.arange(10.0, 70.0, 10.0)
+    frame = pd.DataFrame({"X": x, "Z": x, "Y": 6.0 * x})
+    scaling = Scaling(
+        target={"method": "fixed", "value": 100.0},
+        channel={"method": "fixed", "value": 10.0},
+    )
+
+    shadowed = pathmc.model(
+        "Y ~ b*X + c*Z\nb := b + 1",
+        data=frame,
+        scaling=scaling,
+    )
+    shadowed.fit()
+    _pin_beta(shadowed, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 0.3})
+    summary = shadowed.effects_summary()
+    plotted = _point_mass_values(shadowed, ["b", "c"])
+    assert summary.loc["b", "mean"] == pytest.approx(21.0)
+    assert plotted[0] == pytest.approx(summary.loc["b", "mean"])
+    assert plotted[1] == pytest.approx(summary.loc["c", "mean"])
+    assert plotted[1] == pytest.approx(3.0)
+
+    earlier = pathmc.model(
+        "Y ~ b*X + c*Z\nshifted := b + 1\nb := c",
+        data=frame,
+        scaling=scaling,
+    )
+    earlier.fit()
+    _pin_beta(earlier, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 0.3})
+    earlier_summary = earlier.effects_summary()
+    shifted = _point_mass_values(earlier, ["shifted"])
+    redefined = _point_mass_values(earlier, ["b"])
+    assert earlier_summary.loc["shifted", "mean"] == pytest.approx(21.0)
+    assert shifted[0] == pytest.approx(21.0)
+    assert redefined[0] == pytest.approx(earlier_summary.loc["b", "mean"])
+    assert redefined[0] == pytest.approx(3.0)
+
+    later = pathmc.model(
+        "Y ~ b*X + c*Z\nb := c\nlater := b + 1",
+        data=frame,
+        scaling=scaling,
+    )
+    later.fit()
+    _pin_beta(later, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 0.3})
+    assert _point_mass_values(later, ["later"])[0] == pytest.approx(
+        later.effects_summary().loc["later", "mean"]
+    )
+    assert _point_mass_values(later, ["later"])[0] == pytest.approx(4.0)
+
+
 def test_public_hsgp_do_obeys_the_business_boundary(mock_pymc_sample):
     from copy import copy
 

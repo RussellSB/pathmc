@@ -217,8 +217,12 @@ def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], se
     """Return labeled and defined names required to plot ``names``.
 
     A raw posterior name contributes nothing, so requesting it does not
-    enter coefficient conversion. A defined parameter pulls in the labels
-    and earlier defined parameters its expression uses.
+    enter coefficient conversion. A defined parameter pulls in earlier
+    defined parameters its expression can already see, plus labels. Its own
+    name, and a later parameter of the same name, are still the label:
+    ``evaluate_defined_params`` has not overwritten that name yet. That is
+    why ``b := b + 1`` and an earlier ``shifted := b + 1`` before
+    ``b := c`` match ``effects_summary``.
     """
     labels = {
         term.label
@@ -226,20 +230,28 @@ def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], se
         for term in reg.terms
         if term.label is not None
     }
-    defined = {dp.name: dp.expression for dp in spec.defined_params}
+    defined_at = {dp.name: index for index, dp in enumerate(spec.defined_params)}
+    defined_expr = {dp.name: dp.expression for dp in spec.defined_params}
     needed_labels: set[str] = set()
     needed_defined: set[str] = set()
-    pending = list(names)
+    pending = [name for name in names if name in defined_expr]
     seen: set[str] = set()
     while pending:
         name = pending.pop()
         if name in seen:
             continue
         seen.add(name)
-        if name in defined:
-            needed_defined.add(name)
-            pending.extend(_expression_names(defined[name]))
-        elif name in labels:
+        needed_defined.add(name)
+        own_index = defined_at[name]
+        for loaded in _expression_names(defined_expr[name]):
+            loaded_index = defined_at.get(loaded)
+            if loaded_index is not None and loaded_index < own_index:
+                pending.append(loaded)
+                continue
+            if loaded in labels:
+                needed_labels.add(loaded)
+    for name in names:
+        if name in labels and name not in defined_expr:
             needed_labels.add(name)
     return needed_labels, needed_defined
 
