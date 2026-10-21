@@ -654,6 +654,26 @@ class TestCriticRegressions:
         )
         assert_inside(model.plot_dist(["const", "counts"]))
 
+    def test_point_mass_returns_figure_without_a_canvas_renderer(self):
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import FigureCanvasPdf
+        from matplotlib.backends.backend_ps import FigureCanvasPS
+        from matplotlib.backends.backend_svg import FigureCanvasSVG
+        from matplotlib.figure import Figure
+
+        for canvas_cls in (FigureCanvasPdf, FigureCanvasSVG, FigureCanvasPS):
+            fig = Figure()
+            canvas_cls(fig)
+            ax = fig.add_subplot(111)
+            returned = plot_density(np.full(8, -2.0), ref=0, ax=ax)
+            assert returned is fig
+            assert any("point mass at -2" in text.get_text() for text in ax.texts)
+
+        closed, closed_ax = plt.subplots()
+        plt.close(closed)
+        returned = plot_density(np.full(8, -2.0), ax=closed_ax)
+        assert returned is closed
+
     def test_cleared_axes_accepts_a_different_kind(self):
         import matplotlib.pyplot as plt
 

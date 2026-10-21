@@ -169,40 +169,64 @@ def _label_inside_axes(box: Any, ax_box: Any) -> bool:
     return box.x0 >= ax_box.x0 - 1 and box.x1 <= ax_box.x1 + 1
 
 
+def _optional_renderer(figure: Any) -> Any | None:
+    """Return a renderer, or None on PDF, SVG, PS, and closed figures.
+
+    Those canvases have no ``get_renderer``. Calling it crashed constant
+    draws while KDE and bar plots still returned a figure.
+    """
+    getter = getattr(figure.canvas, "get_renderer", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except AttributeError:
+        return None
+
+
+def _set_point_mass_side(ann: Any, *, offset: float, ha: str) -> None:
+    ann.xyann = (offset, -14)
+    ann.set_ha(ha)
+
+
 def _reposition_point_mass_labels(ax: matplotlib.axes.Axes) -> None:
     """Move point-mass text inside the axes after later artists change xlim.
 
     A label placed against the limits at draw time stays put when a later
     series, reference line, or tight_layout moves that point toward an edge.
-    ``clip_on`` would then hide the value instead of keeping it readable.
+    The side comes from those final limits, so a canvas without a renderer
+    still returns a figure. Pixel measurement only nudges a label that is
+    still outside, and only when a renderer exists.
     """
     labels = _point_mass_labels(ax)
     figure = ax.figure
     if not labels or figure is None:
         return
-    figure.canvas.draw()
-    renderer = cast(Any, figure.canvas).get_renderer()
     left, right = ax.get_xlim()
     for ann in labels:
         value = float(ann.xy[0])
         if (value - left) >= (right - value):
-            sides = ((-6, "right"), (6, "left"))
+            _set_point_mass_side(ann, offset=-6, ha="right")
         else:
-            sides = ((6, "left"), (-6, "right"))
-        placed = False
-        for offset, ha in sides:
-            ann.xyann = (offset, -14)
-            ann.set_ha(ha)
-            figure.canvas.draw()
-            box = ann.get_window_extent(renderer)
-            ax_box = ax.get_window_extent(renderer)
-            if _label_inside_axes(box, ax_box):
-                placed = True
-                break
-        if placed:
-            continue
+            _set_point_mass_side(ann, offset=6, ha="left")
+    renderer = _optional_renderer(figure)
+    if renderer is None:
+        return
+    figure.canvas.draw()
+    for ann in labels:
         box = ann.get_window_extent(renderer)
         ax_box = ax.get_window_extent(renderer)
+        if _label_inside_axes(box, ax_box):
+            continue
+        if ann.get_ha() == "right":
+            _set_point_mass_side(ann, offset=6, ha="left")
+        else:
+            _set_point_mass_side(ann, offset=-6, ha="right")
+        figure.canvas.draw()
+        box = ann.get_window_extent(renderer)
+        ax_box = ax.get_window_extent(renderer)
+        if _label_inside_axes(box, ax_box):
+            continue
         dx_px = 0.0
         if box.x0 < ax_box.x0:
             dx_px = (ax_box.x0 - box.x0) + 1
