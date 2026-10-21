@@ -448,6 +448,7 @@ PUBLIC_METHOD_CONTRACTS = {
         "set_priors": "mutation",
         "sample_prior_predictive": "internal",
         "summary": "internal",
+        "plot_dist": "internal",
         "effects_summary": "business",
         "standardized": "dimensionless",
         "effect": "business",
