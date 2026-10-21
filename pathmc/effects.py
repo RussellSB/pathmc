@@ -290,6 +290,39 @@ def _labeled_coef_business_scale(
     return 1.0
 
 
+def user_facing_labeled_draws(
+    spec: Spec,
+    idata: xr.DataTree,
+    *,
+    scaling_factors: ScalingFactors | None = None,
+    data: nw.DataFrame | None = None,
+) -> dict[str, np.ndarray]:
+    """Labeled coefficients and ``:=`` draws on the effects_summary scale.
+
+    With scaling factors and data, labeled draws are converted to business
+    units before defined parameters are evaluated. A product such as
+    ``indirect := a*b`` is then the product of the rescaled draws, not a
+    rescaled product of internal draws. Without scaling, draws stay on the
+    estimation scale. Raw posterior variables are not included.
+    """
+    labeled_draws = extract_labeled_draws(spec, idata)
+    if scaling_factors is not None and data is not None:
+        converted: dict[str, np.ndarray] = {}
+        for reg in spec.regressions:
+            for term in reg.terms:
+                if term.label is None or term.label not in labeled_draws:
+                    continue
+                converted[term.label] = np.asarray(
+                    scaling_factors.to_business(
+                        labeled_draws[term.label],
+                        kind="coefficient",
+                        dims=ScaleContext(term=term, outcome=reg.lhs, data=data),
+                    )
+                )
+        labeled_draws = converted
+    return {**labeled_draws, **evaluate_defined_params(spec, labeled_draws)}
+
+
 def build_effects_summary(
     spec: Spec,
     idata: xr.DataTree,
@@ -310,24 +343,12 @@ def build_effects_summary(
     pd.DataFrame
         Summary with mean, sd, hdi_3%, hdi_97% for each effect.
     """
-    labeled_draws = extract_labeled_draws(spec, idata)
-    if scaling_factors is not None and data is not None:
-        converted: dict[str, np.ndarray] = {}
-        for reg in spec.regressions:
-            for term in reg.terms:
-                if term.label is None or term.label not in labeled_draws:
-                    continue
-                converted[term.label] = np.asarray(
-                    scaling_factors.to_business(
-                        labeled_draws[term.label],
-                        kind="coefficient",
-                        dims=ScaleContext(term=term, outcome=reg.lhs, data=data),
-                    )
-                )
-        labeled_draws = converted
-    defined_draws = evaluate_defined_params(spec, labeled_draws)
-
-    all_draws = {**labeled_draws, **defined_draws}
+    all_draws = user_facing_labeled_draws(
+        spec,
+        idata,
+        scaling_factors=scaling_factors,
+        data=data,
+    )
 
     rows = []
     for name, draws in all_draws.items():

@@ -429,6 +429,7 @@ _EXECUTABLE_NUMERIC_METHODS = frozenset({
     "comparisons",
     "slopes",
     "datagrid",
+    "plot_dist",
 })
 
 
@@ -448,7 +449,7 @@ PUBLIC_METHOD_CONTRACTS = {
         "set_priors": "mutation",
         "sample_prior_predictive": "internal",
         "summary": "internal",
-        "plot_dist": "internal",
+        "plot_dist": "labeled-business-raw-internal",
         "effects_summary": "business",
         "standardized": "dimensionless",
         "effect": "business",
@@ -495,6 +496,7 @@ def test_every_business_facing_numeric_contract_is_executable():
         "business-and-dimensionless",
         "business-diff-or-dimensionless-ratio",
         "kind-dependent",
+        "labeled-business-raw-internal",
     }
     required = {
         name
@@ -682,6 +684,28 @@ def _datagrid(model: PathModel) -> np.ndarray:
     return model.datagrid(T=[0.0, 1.0]).select_dtypes(include="number").to_numpy()
 
 
+def _point_mass_values(model: PathModel, names: list[str]) -> np.ndarray:
+    """X positions of point-mass series, in ``names`` order."""
+    import matplotlib.pyplot as plt
+
+    fig = model.plot_dist(names)
+    try:
+        values: list[float] = []
+        for line in fig.axes[0].lines:
+            x = np.asarray(line.get_xdata(), dtype=float)
+            y = np.asarray(line.get_ydata(), dtype=float)
+            if x.size >= 2 and np.allclose(x, x[0]) and np.ptp(y) > 0:
+                values.append(float(x[0]))
+        assert len(values) == len(names)
+        return np.asarray(values)
+    finally:
+        plt.close(fig)
+
+
+def _plot_dist(model: PathModel) -> np.ndarray:
+    return _point_mass_values(model, ["b", "c"])
+
+
 SurfaceCase = Callable[[PathModel], np.ndarray]
 BUSINESS_SURFACE_CASES: dict[str, SurfaceCase] = {
     "effects_summary": _effects_summary,
@@ -701,6 +725,7 @@ BUSINESS_SURFACE_CASES: dict[str, SurfaceCase] = {
     "comparisons": _comparisons,
     "slopes": _slopes,
     "datagrid": _datagrid,
+    "plot_dist": _plot_dist,
 }
 
 
@@ -947,6 +972,75 @@ def test_public_defined_parameter_uses_business_coefficients(mock_pymc_sample):
     assert summary.loc["a", "mean"] == pytest.approx(20.0)
     assert summary.loc["b", "mean"] == pytest.approx(3.0)
     assert summary.loc["indirect", "mean"] == pytest.approx(60.0)
+
+
+def test_plot_dist_labeled_names_match_effects_summary(mock_pymc_sample):
+    x = np.arange(10.0, 70.0, 10.0)
+    frame = pd.DataFrame({"X": x, "M": 2.0 * x, "Y": 6.0 * x})
+    model = pathmc.model(
+        "M ~ a*X\nY ~ b*M\nindirect := a*b",
+        data=frame,
+        scaling=Scaling(
+            target={"method": "fixed", "value": 100.0},
+            channel={"method": "fixed", "value": 10.0},
+        ),
+    )
+    model.fit()
+    _pin_beta(model, "M", {"Intercept": 0.0, "X": 2.0})
+    _pin_beta(model, "Y", {"Intercept": 0.0, "M": 3.0})
+    posterior = model._idata["posterior"].dataset.copy(deep=True)
+    posterior["sigma_Y"] = posterior["sigma_Y"] * 0 + 1.5
+    model._idata["posterior"].dataset = posterior
+
+    summary = model.effects_summary()
+    labeled = _point_mass_values(model, ["a", "b", "indirect"])
+    raw = _point_mass_values(model, ["sigma_Y"])
+
+    assert labeled[0] == pytest.approx(summary.loc["a", "mean"])
+    assert labeled[1] == pytest.approx(summary.loc["b", "mean"])
+    assert labeled[2] == pytest.approx(summary.loc["indirect", "mean"])
+    assert labeled[2] == pytest.approx(labeled[0] * labeled[1])
+    assert labeled[2] != pytest.approx(2.0 * 3.0)
+    assert raw[0] == pytest.approx(1.5)
+
+
+def test_plot_dist_per_unit_uses_the_effects_summary_reduction(mock_pymc_sample):
+    frame = pd.concat(
+        [
+            pd.DataFrame({
+                "geo": geo,
+                "week": np.arange(4),
+                "X": np.linspace(10.0, 40.0, 4),
+                "Y": np.linspace(100.0, 400.0, 4),
+            })
+            for geo in ("A", "B")
+        ],
+        ignore_index=True,
+    )
+    model = pathmc.model(
+        "Y ~ b*X\nproduct := b*b",
+        data=frame,
+        panel={"unit": "geo", "time": "week"},
+        scaling=Scaling(
+            target={
+                "method": "fixed",
+                "value": {"A": 100.0, "B": 400.0},
+                "dims": ("geo",),
+            },
+            channel={"method": "fixed", "value": 10.0},
+        ),
+    )
+    model.fit()
+    _pin_beta(model, "Y", {"Intercept": 0.0, "X": 2.0})
+
+    summary = model.effects_summary()
+    plotted = _point_mass_values(model, ["b", "product"])
+
+    assert plotted[0] == pytest.approx(summary.loc["b", "mean"])
+    assert plotted[1] == pytest.approx(summary.loc["product", "mean"])
+    assert plotted[1] == pytest.approx(plotted[0] ** 2)
+    assert plotted[0] != pytest.approx(20.0)
+    assert plotted[0] != pytest.approx(80.0)
 
 
 def test_public_hsgp_do_obeys_the_business_boundary(mock_pymc_sample):

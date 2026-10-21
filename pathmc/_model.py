@@ -49,8 +49,7 @@ from pathmc.effects import (
     build_effects_summary,
     build_standardized_effects,
     compute_path_effect,
-    evaluate_defined_params,
-    extract_labeled_draws,
+    user_facing_labeled_draws,
 )
 from pathmc.falsify import FalsificationResult, falsify_graph as _falsify_graph
 from pathmc.graph import GraphInfo, build_graph
@@ -874,6 +873,13 @@ class PathModel:
 
         Each name in *var* may be a labeled coefficient (``"a"``), a defined
         parameter (``"indirect"``), or a raw posterior variable (``"sigma_Y"``).
+        Labeled coefficients and ``:=`` parameters use the business-unit draws
+        reported by ``effects_summary``: coefficients are rescaled first, then
+        the expression is evaluated. Raw posterior variables stay on the
+        estimation scale used by ``summary``. A reference copied from
+        ``effects_summary`` therefore meets a labeled series and does not meet
+        a raw series.
+
         A raw variable plots without *coords* when every non-sample dimension
         has size 1. A dimension that still has size greater than 1 after
         selection must be named in *coords*. Selectors are applied only to
@@ -939,8 +945,12 @@ class PathModel:
                 "Pass a label, defined parameter, or posterior variable name."
             )
 
-        labeled = extract_labeled_draws(self._spec, idata)
-        named_draws = {**labeled, **evaluate_defined_params(self._spec, labeled)}
+        named_draws = user_facing_labeled_draws(
+            self._spec,
+            idata,
+            scaling_factors=self._scaling_factors,
+            data=self._data,
+        )
         posterior_ds = posterior(idata)
         if aggregate is not None and all(name in named_draws for name in var):
             raise ValueError(
