@@ -1177,6 +1177,72 @@ def test_plot_dist_uses_a_label_its_own_parameter_has_not_overwritten(
     assert _point_mass_values(later, ["later"])[0] == pytest.approx(4.0)
 
 
+def test_plot_dist_follows_each_assignment_of_a_reused_name(mock_pymc_sample):
+    x = np.arange(10.0, 70.0, 10.0)
+    frame = pd.DataFrame({"X": x, "Z": x, "Y": 6.0 * x})
+    scaling = Scaling(
+        target={"method": "fixed", "value": 100.0},
+        channel={"method": "fixed", "value": 10.0},
+    )
+
+    def fit(spec: str) -> pathmc.PathModel:
+        model = pathmc.model(spec, data=frame, scaling=scaling)
+        model.fit()
+        _pin_beta(model, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 0.3})
+        return model
+
+    redefined = fit("Y ~ b*X + c*Z\nb := c\nb := b + 1")
+    assert redefined.effects_summary().loc["b", "mean"] == pytest.approx(4.0)
+    assert _point_mass_values(redefined, ["b"])[0] == pytest.approx(4.0)
+
+    mid = fit("Y ~ b*X + c*Z\nb := c + 1\nmid := b\nb := c")
+    assert mid.effects_summary().loc["mid", "mean"] == pytest.approx(4.0)
+    assert _point_mass_values(mid, ["mid"])[0] == pytest.approx(4.0)
+    together = _point_mass_values(mid, ["mid", "b"])
+    assert together[0] == pytest.approx(4.0)
+    assert together[1] == pytest.approx(3.0)
+
+    chain = fit("Y ~ b*X + c*Z\nb := b + 1\nalias := b\nshifted := alias\nb := c")
+    assert chain.effects_summary().loc["shifted", "mean"] == pytest.approx(21.0)
+    assert _point_mass_values(chain, ["shifted"])[0] == pytest.approx(21.0)
+    assert _point_mass_values(chain, ["alias"])[0] == pytest.approx(21.0)
+    assert _point_mass_values(chain, ["b"])[0] == pytest.approx(3.0)
+
+    panel = pd.concat(
+        [
+            pd.DataFrame({
+                "geo": geo,
+                "week": np.arange(4),
+                "X": np.linspace(10.0, 40.0, 4),
+                "Z": np.linspace(10.0, 40.0, 4),
+                "Y": np.linspace(100.0, 400.0, 4),
+            })
+            for geo in ("A", "B")
+        ],
+        ignore_index=True,
+    )
+    per_unit = pathmc.model(
+        "Y ~ b*X + c*Z\nb := b + 1\nshifted := b + 1\nb := c",
+        data=panel,
+        panel={"unit": "geo", "time": "week"},
+        scaling=Scaling(
+            target={
+                "method": "fixed",
+                "value": {"A": 100.0, "B": 400.0},
+                "dims": ("geo",),
+            },
+            channel={"method": "fixed", "value": 10.0},
+        ),
+    )
+    per_unit.fit()
+    _pin_beta(per_unit, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 0.3})
+    summary = per_unit.effects_summary()
+    assert summary.loc["shifted", "mean"] == pytest.approx(52.0)
+    assert summary.loc["b", "mean"] == pytest.approx(7.5)
+    assert _point_mass_values(per_unit, ["shifted"])[0] == pytest.approx(52.0)
+    assert _point_mass_values(per_unit, ["b"])[0] == pytest.approx(7.5)
+
+
 def test_public_hsgp_do_obeys_the_business_boundary(mock_pymc_sample):
     from copy import copy
 

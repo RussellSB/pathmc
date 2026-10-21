@@ -213,16 +213,24 @@ def _expression_names(expression: str) -> set[str]:
     }
 
 
-def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], set[str]]:
-    """Return labeled and defined names required to plot ``names``.
+def _latest_earlier_definition(spec: Spec, name: str, before: int) -> int | None:
+    """Latest ``:=`` of ``name`` whose index is strictly less than ``before``."""
+    for index in range(before - 1, -1, -1):
+        if spec.defined_params[index].name == name:
+            return index
+    return None
+
+
+def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], set[int]]:
+    """Return labels and ``:=`` indices required to plot ``names``.
 
     A raw posterior name contributes nothing, so requesting it does not
-    enter coefficient conversion. A defined parameter pulls in earlier
-    defined parameters its expression can already see, plus labels. Its own
-    name, and a later parameter of the same name, are still the label:
-    ``evaluate_defined_params`` has not overwritten that name yet. That is
-    why ``b := b + 1`` and an earlier ``shifted := b + 1`` before
-    ``b := c`` match ``effects_summary``.
+    enter coefficient conversion. A name can be assigned more than once.
+    Each load resolves to the latest assignment with a strictly smaller
+    index, otherwise to the label. A parameter cannot see its own result,
+    and an earlier expression cannot see a later assignment of the same
+    name. Selecting indices, not names, keeps an unused earlier assignment
+    from running and hiding the label that assignment still needs.
     """
     labels = {
         term.label
@@ -230,30 +238,28 @@ def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], se
         for term in reg.terms
         if term.label is not None
     }
-    defined_at = {dp.name: index for index, dp in enumerate(spec.defined_params)}
-    defined_expr = {dp.name: dp.expression for dp in spec.defined_params}
+    last_index = {dp.name: index for index, dp in enumerate(spec.defined_params)}
     needed_labels: set[str] = set()
-    needed_defined: set[str] = set()
-    pending = [name for name in names if name in defined_expr]
-    seen: set[str] = set()
+    needed_indices: set[int] = set()
+    pending = [last_index[name] for name in names if name in last_index]
+    seen: set[int] = set()
     while pending:
-        name = pending.pop()
-        if name in seen:
+        index = pending.pop()
+        if index in seen:
             continue
-        seen.add(name)
-        needed_defined.add(name)
-        own_index = defined_at[name]
-        for loaded in _expression_names(defined_expr[name]):
-            loaded_index = defined_at.get(loaded)
-            if loaded_index is not None and loaded_index < own_index:
-                pending.append(loaded)
+        seen.add(index)
+        needed_indices.add(index)
+        for loaded in _expression_names(spec.defined_params[index].expression):
+            earlier = _latest_earlier_definition(spec, loaded, index)
+            if earlier is not None:
+                pending.append(earlier)
                 continue
             if loaded in labels:
                 needed_labels.add(loaded)
     for name in names:
-        if name in labels and name not in defined_expr:
+        if name in labels and name not in last_index:
             needed_labels.add(name)
-    return needed_labels, needed_defined
+    return needed_labels, needed_indices
 
 
 def evaluate_defined_params(
@@ -261,6 +267,7 @@ def evaluate_defined_params(
     labeled_draws: dict[str, np.ndarray],
     *,
     only: Collection[str] | None = None,
+    indices: Collection[int] | None = None,
 ) -> dict[str, np.ndarray]:
     """Evaluate ``:=`` expressions over posterior draws.
 
@@ -270,8 +277,15 @@ def evaluate_defined_params(
         Parsed model specification containing defined parameter expressions.
     labeled_draws : dict[str, np.ndarray]
     only : Collection[str] | None
-        Defined parameters to evaluate. ``None`` evaluates every expression.
-        A subset must include parameters that later expressions depend on.
+        Defined-parameter names to evaluate. ``None`` does not filter by
+        name. A name can be assigned more than once; this still runs every
+        assignment of each selected name.
+    indices : Collection[int] | None
+        Definition positions to evaluate, in spec order. Unlike ``only``,
+        this skips an earlier assignment of the same name unless that
+        assignment is one of the positions. A later expression then still
+        sees the label, matching a full ``effects_summary`` pass that has
+        not reached the later assignment.
 
     Returns
     -------
@@ -285,7 +299,9 @@ def evaluate_defined_params(
     # into later ones (e.g. total := indirect + c).
     affected_names = set(affected_labels)
 
-    for dp in spec.defined_params:
+    for index, dp in enumerate(spec.defined_params):
+        if indices is not None and index not in indices:
+            continue
         if only is not None and dp.name not in only:
             continue
         namespace: dict = {k: v for k, v in labeled_draws.items()}
@@ -379,12 +395,12 @@ def user_facing_labeled_draws(
     """
     labeled_draws = extract_labeled_draws(spec, idata)
     needed_labels: set[str] | None
-    needed_defined: set[str] | None
+    needed_indices: set[int] | None
     if names is None:
         needed_labels = None
-        needed_defined = None
+        needed_indices = None
     else:
-        needed_labels, needed_defined = _draw_dependencies(spec, names)
+        needed_labels, needed_indices = _draw_dependencies(spec, names)
     if scaling_factors is not None and data is not None:
         converted: dict[str, np.ndarray] = {}
         for reg in spec.regressions:
@@ -424,7 +440,7 @@ def user_facing_labeled_draws(
         }
     return {
         **labeled_draws,
-        **evaluate_defined_params(spec, labeled_draws, only=needed_defined),
+        **evaluate_defined_params(spec, labeled_draws, indices=needed_indices),
     }
 
 
