@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -198,9 +199,42 @@ def extract_labeled_draws(
     return labeled_draws
 
 
+def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], set[str]]:
+    """Return labeled and defined names required to plot ``names``.
+
+    A raw posterior name contributes nothing, so requesting it does not
+    enter coefficient conversion. A defined parameter pulls in the labels
+    and earlier defined parameters its expression uses.
+    """
+    labels = {
+        term.label
+        for reg in spec.regressions
+        for term in reg.terms
+        if term.label is not None
+    }
+    defined = {dp.name: dp.expression for dp in spec.defined_params}
+    needed_labels: set[str] = set()
+    needed_defined: set[str] = set()
+    pending = list(names)
+    seen: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in defined:
+            needed_defined.add(name)
+            pending.extend(re.findall(r"[A-Za-z_]\w*", defined[name]))
+        elif name in labels:
+            needed_labels.add(name)
+    return needed_labels, needed_defined
+
+
 def evaluate_defined_params(
     spec: Spec,
     labeled_draws: dict[str, np.ndarray],
+    *,
+    only: Collection[str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Evaluate ``:=`` expressions over posterior draws.
 
@@ -209,7 +243,9 @@ def evaluate_defined_params(
     spec : Spec
         Parsed model specification containing defined parameter expressions.
     labeled_draws : dict[str, np.ndarray]
-        Posterior draws for labeled coefficients.
+    only : Collection[str] | None
+        Defined parameters to evaluate. ``None`` evaluates every expression.
+        A subset must include parameters that later expressions depend on.
 
     Returns
     -------
@@ -224,6 +260,8 @@ def evaluate_defined_params(
     affected_names = set(affected_labels)
 
     for dp in spec.defined_params:
+        if only is not None and dp.name not in only:
+            continue
         namespace: dict = {k: v for k, v in labeled_draws.items()}
         namespace.update(defined_draws)
         namespace["__builtins__"] = {}
@@ -296,6 +334,7 @@ def user_facing_labeled_draws(
     *,
     scaling_factors: ScalingFactors | None = None,
     data: nw.DataFrame | None = None,
+    names: Collection[str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Labeled coefficients and ``:=`` draws on the effects_summary scale.
 
@@ -304,23 +343,63 @@ def user_facing_labeled_draws(
     ``indirect := a*b`` is then the product of the rescaled draws, not a
     rescaled product of internal draws. Without scaling, draws stay on the
     estimation scale. Raw posterior variables are not included.
+
+    ``names`` limits conversion to labels required by those requests. A raw
+    name then does not enter coefficient conversion, so a coefficient on a
+    transform that does not declare ``homogeneous`` cannot block an unrelated
+    plot. Requesting that coefficient, or a defined parameter that uses it,
+    still raises, and the error names the requested term. ``None`` converts
+    every labeled coefficient, which is what ``effects_summary`` needs.
     """
     labeled_draws = extract_labeled_draws(spec, idata)
+    needed_labels: set[str] | None
+    needed_defined: set[str] | None
+    if names is None:
+        needed_labels = None
+        needed_defined = None
+    else:
+        needed_labels, needed_defined = _draw_dependencies(spec, names)
     if scaling_factors is not None and data is not None:
         converted: dict[str, np.ndarray] = {}
         for reg in spec.regressions:
             for term in reg.terms:
                 if term.label is None or term.label not in labeled_draws:
                     continue
-                converted[term.label] = np.asarray(
-                    scaling_factors.to_business(
-                        labeled_draws[term.label],
-                        kind="coefficient",
-                        dims=ScaleContext(term=term, outcome=reg.lhs, data=data),
+                if needed_labels is not None and term.label not in needed_labels:
+                    continue
+                try:
+                    converted[term.label] = np.asarray(
+                        scaling_factors.to_business(
+                            labeled_draws[term.label],
+                            kind="coefficient",
+                            dims=ScaleContext(term=term, outcome=reg.lhs, data=data),
+                        )
                     )
-                )
+                except ValueError as exc:
+                    if names is None:
+                        raise
+                    requesters = [
+                        name
+                        for name in names
+                        if term.label in _draw_dependencies(spec, [name])[0]
+                    ]
+                    requested = ", ".join(repr(name) for name in requesters)
+                    raise ValueError(
+                        f"Cannot plot {requested} in business units because "
+                        f"labeled coefficient {term.label!r} cannot be "
+                        f"rescaled. {exc}"
+                    ) from exc
         labeled_draws = converted
-    return {**labeled_draws, **evaluate_defined_params(spec, labeled_draws)}
+    elif needed_labels is not None:
+        labeled_draws = {
+            name: value
+            for name, value in labeled_draws.items()
+            if name in needed_labels
+        }
+    return {
+        **labeled_draws,
+        **evaluate_defined_params(spec, labeled_draws, only=needed_defined),
+    }
 
 
 def build_effects_summary(

@@ -684,11 +684,11 @@ def _datagrid(model: PathModel) -> np.ndarray:
     return model.datagrid(T=[0.0, 1.0]).select_dtypes(include="number").to_numpy()
 
 
-def _point_mass_values(model: PathModel, names: list[str]) -> np.ndarray:
+def _point_mass_values(model: PathModel, names: list[str], **kwargs) -> np.ndarray:
     """X positions of point-mass series, in ``names`` order."""
     import matplotlib.pyplot as plt
 
-    fig = model.plot_dist(names)
+    fig = model.plot_dist(names, **kwargs)
     try:
         values: list[float] = []
         for line in fig.axes[0].lines:
@@ -1041,6 +1041,61 @@ def test_plot_dist_per_unit_uses_the_effects_summary_reduction(mock_pymc_sample)
     assert plotted[1] == pytest.approx(plotted[0] ** 2)
     assert plotted[0] != pytest.approx(20.0)
     assert plotted[0] != pytest.approx(80.0)
+
+
+def test_plot_dist_skips_unscalable_labels_it_did_not_request(mock_pymc_sample):
+    from pathmc.transforms import REGISTRY, ParamSpec, Transform, register_transform
+
+    class _Hillish(Transform):
+        name = "hillish"
+        param_specs = {
+            "n": ParamSpec(constraint="positive", default_prior="HalfNormal(1)")
+        }
+        homogeneous = None
+
+        def apply_pymc(self, x, params, *, panel_info=None, data=None):
+            return x
+
+    x = np.arange(10.0, 70.0, 10.0)
+    frame = pd.DataFrame({"X": x, "Z": x, "Y": 6.0 * x})
+    register_transform(_Hillish())
+    try:
+        model = pathmc.model(
+            "Y ~ b*X + c*hillish(Z, n=n)\nonly_b := b + 1\nuses_c := b + c",
+            data=frame,
+            scaling=Scaling(
+                target={"method": "fixed", "value": 100.0},
+                channel={"method": "fixed", "value": 10.0},
+            ),
+        )
+        model.fit()
+        _pin_beta(model, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 2.0})
+        posterior = model._idata["posterior"].dataset.copy(deep=True)
+        posterior["sigma_Y"] = posterior["sigma_Y"] * 0 + 1.25
+        posterior["n"] = posterior["n"] * 0 + 0.4
+        model._idata["posterior"].dataset = posterior
+
+        plotted = _point_mass_values(model, ["sigma_Y", "b", "only_b", "n"])
+        assert plotted[0] == pytest.approx(1.25)
+        assert plotted[1] == pytest.approx(20.0)
+        assert plotted[2] == pytest.approx(21.0)
+        assert plotted[3] == pytest.approx(0.4)
+        raw_beta = _point_mass_values(model, ["beta_Y"], coords={"Y_predictors": "X"})
+        assert raw_beta[0] == pytest.approx(2.0)
+
+        with pytest.raises(ValueError, match="'c'"):
+            model.plot_dist("c")
+        with pytest.raises(ValueError, match="'uses_c'"):
+            model.plot_dist("uses_c")
+        with pytest.raises(ValueError, match="hillish"):
+            model.effects_summary()
+
+        REGISTRY["hillish"].homogeneous = False
+        declared = _point_mass_values(model, ["c", "uses_c"])
+        assert declared[0] == pytest.approx(200.0)
+        assert declared[1] == pytest.approx(220.0)
+    finally:
+        REGISTRY.pop("hillish", None)
 
 
 def test_public_hsgp_do_obeys_the_business_boundary(mock_pymc_sample):

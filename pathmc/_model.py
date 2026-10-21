@@ -875,10 +875,13 @@ class PathModel:
         parameter (``"indirect"``), or a raw posterior variable (``"sigma_Y"``).
         Labeled coefficients and ``:=`` parameters use the business-unit draws
         reported by ``effects_summary``: coefficients are rescaled first, then
-        the expression is evaluated. Raw posterior variables stay on the
-        estimation scale used by ``summary``. A reference copied from
-        ``effects_summary`` therefore meets a labeled series and does not meet
-        a raw series.
+        the expression is evaluated. Only labels required by *var* are
+        rescaled, so a raw name still plots when another coefficient sits on
+        a transform that does not declare ``homogeneous``. Requesting that
+        coefficient, or a ``:=`` parameter that uses it, raises and names the
+        requested term. Raw posterior variables stay on the estimation scale
+        used by ``summary``. A reference copied from ``effects_summary``
+        therefore meets a labeled series and does not meet a raw series.
 
         A raw variable plots without *coords* when every non-sample dimension
         has size 1. A dimension that still has size greater than 1 after
@@ -950,6 +953,7 @@ class PathModel:
             idata,
             scaling_factors=self._scaling_factors,
             data=self._data,
+            names=var,
         )
         posterior_ds = posterior(idata)
         if aggregate is not None and all(name in named_draws for name in var):
