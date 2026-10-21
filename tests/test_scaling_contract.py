@@ -1044,7 +1044,12 @@ def test_plot_dist_per_unit_uses_the_effects_summary_reduction(mock_pymc_sample)
 
 
 def test_plot_dist_skips_unscalable_labels_it_did_not_request(mock_pymc_sample):
+    from pathmc.effects import _expression_names
     from pathmc.transforms import REGISTRY, ParamSpec, Transform, register_transform
+
+    assert _expression_names("(b + 1).mean()") == {"b"}
+    assert _expression_names("b * 1e-2") == {"b"}
+    assert _expression_names("b * 1E-2") == {"b"}
 
     class _Hillish(Transform):
         name = "hillish"
@@ -1057,11 +1062,17 @@ def test_plot_dist_skips_unscalable_labels_it_did_not_request(mock_pymc_sample):
             return x
 
     x = np.arange(10.0, 70.0, 10.0)
-    frame = pd.DataFrame({"X": x, "Z": x, "Y": 6.0 * x})
+    frame = pd.DataFrame({"X": x, "Z": x, "W": x, "V": x, "Y": 6.0 * x})
     register_transform(_Hillish())
     try:
         model = pathmc.model(
-            "Y ~ b*X + c*hillish(Z, n=n)\nonly_b := b + 1\nuses_c := b + c",
+            "Y ~ b*X + e*hillish(Z, n=n) + shape*hillish(W, n=m)"
+            " + E*hillish(V, n=p)\n"
+            "only_b := b + 1\n"
+            "uses_e := b + e\n"
+            "safe_sci := b * 1e-2\n"
+            "safe_exp := b * 1E-2\n"
+            "safe_attr := (b + 1) + 0 * (b + 1).shape[0]",
             data=frame,
             scaling=Scaling(
                 target={"method": "fixed", "value": 100.0},
@@ -1069,29 +1080,45 @@ def test_plot_dist_skips_unscalable_labels_it_did_not_request(mock_pymc_sample):
             ),
         )
         model.fit()
-        _pin_beta(model, "Y", {"Intercept": 0.0, "X": 2.0, "Z": 2.0})
+        _pin_beta(
+            model,
+            "Y",
+            {"Intercept": 0.0, "X": 2.0, "Z": 2.0, "W": 2.0, "V": 2.0},
+        )
         posterior = model._idata["posterior"].dataset.copy(deep=True)
         posterior["sigma_Y"] = posterior["sigma_Y"] * 0 + 1.25
         posterior["n"] = posterior["n"] * 0 + 0.4
         model._idata["posterior"].dataset = posterior
 
-        plotted = _point_mass_values(model, ["sigma_Y", "b", "only_b", "n"])
+        plotted = _point_mass_values(
+            model,
+            ["sigma_Y", "b", "only_b", "n", "safe_sci", "safe_exp", "safe_attr"],
+        )
         assert plotted[0] == pytest.approx(1.25)
         assert plotted[1] == pytest.approx(20.0)
         assert plotted[2] == pytest.approx(21.0)
         assert plotted[3] == pytest.approx(0.4)
+        assert plotted[4] == pytest.approx(0.2)
+        assert plotted[5] == pytest.approx(0.2)
+        assert plotted[6] == pytest.approx(21.0)
         raw_beta = _point_mass_values(model, ["beta_Y"], coords={"Y_predictors": "X"})
         assert raw_beta[0] == pytest.approx(2.0)
 
-        with pytest.raises(ValueError, match="'c'"):
-            model.plot_dist("c")
-        with pytest.raises(ValueError, match="'uses_c'"):
-            model.plot_dist("uses_c")
+        with pytest.raises(ValueError, match="'e'"):
+            model.plot_dist("e")
+        with pytest.raises(ValueError, match="'uses_e'"):
+            model.plot_dist("uses_e")
+        with pytest.raises(ValueError, match="'shape'"):
+            model.plot_dist("shape")
+        with pytest.raises(KeyError, match="safe_sci") as missing:
+            model.plot_dist(["b", "not_a_name"])
+        assert "not_a_name" in str(missing.value)
+        assert "Available labels/defined params: []" not in str(missing.value)
         with pytest.raises(ValueError, match="hillish"):
             model.effects_summary()
 
         REGISTRY["hillish"].homogeneous = False
-        declared = _point_mass_values(model, ["c", "uses_c"])
+        declared = _point_mass_values(model, ["e", "uses_e"])
         assert declared[0] == pytest.approx(200.0)
         assert declared[1] == pytest.approx(220.0)
     finally:

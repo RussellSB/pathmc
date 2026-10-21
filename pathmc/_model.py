@@ -988,6 +988,15 @@ class PathModel:
             else None
         )
         panel_units = list(scan_info.unit_labels) if scan_info is not None else None
+        available_named = sorted(
+            {
+                term.label
+                for reg in self._spec.regressions
+                for term in reg.terms
+                if term.label is not None
+            }
+            | {dp.name for dp in self._spec.defined_params}
+        )
         applied: set[str] = set()
         for name in var:
             if name in named_draws:
@@ -996,7 +1005,7 @@ class PathModel:
             if name not in posterior_ds.data_vars:
                 raise KeyError(
                     f"Unknown name '{name}'. Available labels/defined params: "
-                    f"{sorted(named_draws)}; posterior variables: "
+                    f"{available_named}; posterior variables: "
                     f"{sorted(str(v) for v in posterior_ds.data_vars)}"
                 )
             array = posterior_ds[name]

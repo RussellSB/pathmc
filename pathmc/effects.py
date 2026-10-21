@@ -19,7 +19,7 @@ Provides the logic behind ``PathModel.effects_summary()`` and
 
 from __future__ import annotations
 
-import re
+import ast
 import warnings
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -199,6 +199,20 @@ def extract_labeled_draws(
     return labeled_draws
 
 
+def _expression_names(expression: str) -> set[str]:
+    """Names loaded by a ``:=`` expression, ignoring literals and attributes.
+
+    ``b * 1e-2`` loads ``b``, not ``e``. ``(b + 1).mean()`` loads ``b``, not
+    ``mean``. A word regex treats both of those tokens as coefficient names.
+    """
+    tree = ast.parse(expression, mode="eval")
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+
+
 def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], set[str]]:
     """Return labeled and defined names required to plot ``names``.
 
@@ -224,7 +238,7 @@ def _draw_dependencies(spec: Spec, names: Collection[str]) -> tuple[set[str], se
         seen.add(name)
         if name in defined:
             needed_defined.add(name)
-            pending.extend(re.findall(r"[A-Za-z_]\w*", defined[name]))
+            pending.extend(_expression_names(defined[name]))
         elif name in labels:
             needed_labels.add(name)
     return needed_labels, needed_defined
@@ -266,7 +280,7 @@ def evaluate_defined_params(
         namespace.update(defined_draws)
         namespace["__builtins__"] = {}
 
-        tokens = set(re.findall(r"[A-Za-z_]\w*", dp.expression))
+        tokens = _expression_names(dp.expression)
         used_affected = sorted(tokens & affected_names)
         if used_affected:
             edges = sorted({
